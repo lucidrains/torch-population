@@ -1,859 +1,463 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from typing import TYPE_CHECKING, Literal
 
 import torch
-from einops import pack, rearrange, unpack
+from einops import pack
 from torch import Tensor, is_tensor
-from torch.nn import Module, Parameter, ParameterList
+from torch.autograd import grad as torch_grad
+from torch.nn import Module, Parameter
 
 from torch_population.store import (
-    FunctionalOptState,
     OptStore,
-    StoreDict,
     TensorSpec,
     TensorStore,
+    clone_template,
     default,
     exists,
+    init_module,
     is_int_index,
     matches_pattern,
-    materialize_from_template,
-    named_buffer_persistence,
+    normalize_index,
     pad_pop,
-    reset_module_parameters,
+    resolve_indices,
     slice_pop,
     slice_spec,
     unpack_tensors,
 )
 
 if TYPE_CHECKING:
-    from torch_population.optimizers import PopulationOptimizer
+    from torch_population.optimizer import PopulationOptimizer
 
-# unified colocated population parameters container
+# helpers
+
+def _validate_maps(kind: str, maps: list[dict[str, Tensor]]):
+    ref, names = maps[0], list(maps[0])
+    for i, cur in enumerate(maps[1:], start = 1):
+        if list(cur) != names:
+            raise ValueError(f'module {i} {kind} names do not match module 0')
+        for k, t in ref.items():
+            if cur[k].shape != t.shape:
+                raise ValueError(f'{kind} {k!r} shape mismatch: {t.shape} vs {cur[k].shape}')
+
+def _pack_group(specs: list[TensorSpec], mod_params: list[dict[str, Tensor]], is_shared: bool) -> Parameter | None:
+    if not specs:
+        return None
+    if len({mod_params[0][s.name].dtype for s in specs}) > 1:
+        raise ValueError('trainable parameters in a Population must share the same dtype')
+    stacked = [torch.stack([mp[s.name].detach() for mp in mod_params]) for s in specs]
+    if is_shared:
+        packed = pack([t.mean(0) if t.is_floating_point() else t[0] for t in stacked], '*')[0]
+    else:
+        packed = pack(stacked, 'p *')[0]
+    return Parameter(packed, requires_grad = True)
+
+def _copy_tensor_(dst: Tensor, src: Tensor, kind: str, name: str, check_shapes: bool):
+    if check_shapes and src.shape != dst.shape:
+        raise ValueError(f'{kind} {name!r} shape mismatch: {tuple(dst.shape)} vs {tuple(src.shape)}')
+    dst.copy_(src.detach().to(dst))
+
+# parameter layout schema
+
+class _Schema:
+    def __init__(self, ref: Module | None = None, shared = ()):
+        self.specs: list[TensorSpec] = []
+        self.state_dict_map: list[tuple[str, str, bool]] = []
+
+        if exists(ref):
+            named = list(ref.named_parameters())
+            pop_off = sh_off = tidx = 0
+            for name, p in named:
+                sh = matches_pattern(name, shared)
+                if not p.requires_grad:
+                    self.specs.append(TensorSpec(name, tuple(p.shape), p.numel(), 0, False, None, sh))
+                    continue
+                off = sh_off if sh else pop_off
+                self.specs.append(TensorSpec(name, tuple(p.shape), p.numel(), off, True, tidx, sh))
+                if sh:
+                    sh_off += p.numel()
+                else:
+                    pop_off += p.numel()
+                tidx += 1
+
+            by_id = {id(p): (n, True) for n, p in named}
+            by_id.update({id(b): (n, False) for n, b in ref.named_buffers()})
+            pnames = {s.name for s in self.specs}
+            self.state_dict_map = [(k, *by_id.get(id(t), (k, k in pnames))) for k, t in ref.state_dict().items()]
+
+        self.by_name = {s.name: s for s in self.specs}
+        self.trainable = [s for s in self.specs if s.requires_grad]
+        self.pop_trainable = [s for s in self.trainable if not s.shared]
+        self.shared_trainable = [s for s in self.trainable if s.shared]
+        self.has_shared = any(s.shared for s in self.specs)
+
+# unified colocated population parameter container
 
 class PopulationParameters(Module):
-    """Unified colocated storage for parameters, buffers, optimizer states, lanes, EMAs, and meta tensors."""
-
     def __init__(self):
         super().__init__()
-        self.pop_size: int | None = None
-        self.is_functional: bool = False
-        self.specs: list[TensorSpec] = []
-        self._spec_by_name: dict[str, TensorSpec] = {}
-        self._state_dict_key_map: list[tuple[str, str, bool]] = []
-        self._noop_net_ref: list[Module] = []
-        self._template_ref: list[Module] = []
-
-        self._trainable_flats = ParameterList()
-        self._shared_trainable_flats = ParameterList()
-        self._func_trainable_flats: list[Tensor] = []
-        self._func_shared_flats: list[Tensor] = []
-
-        self._frozen_store = TensorStore()
-        self._buffer_store = TensorStore()
-
-        self.opt_stores = StoreDict()
-        self.ema_store = TensorStore()
-        self.meta_store = TensorStore()
-        self.lane_stores = StoreDict()
-        self.substores = StoreDict()
-        self.lanes: dict[str, Tensor] = {}
-
-        self._functional_opt_states: dict[str, FunctionalOptState] = {}
+        self.register_parameter('_pop_param', None)
+        self.register_parameter('_shared_param', None)
+        self.store = TensorStore()
+        self.opt_stores: dict[str, OptStore] = {}
         self._optimizers: dict[str, PopulationOptimizer] = {}
-        self._opt_owners: dict[str, list[PopulationOptimizer]] = {}
         self._default_opt_name: str | None = None
+        self._active_grads: set[str] | None = None
+        self.pop_size: int | None = None
+        object.__setattr__(self, '_noop_net', None)
+        object.__setattr__(self, '_template', None)
+        self._schema = _Schema()
+        self._func_leaves: tuple[Tensor | None, Tensor | None] | None = None
 
-        self._tracking_active_grads: bool = False
-        self._active_grad_params: set[str] = set()
-
-    # initialization & shell configuration
-
-    def _set_shell(
-        self,
-        *,
-        pop_size: int | None,
-        is_functional: bool,
-        noop_net: list[Module],
-        template: list[Module],
-        specs: list[TensorSpec],
-        sd_map: list[tuple[str, str, bool]],
-    ):
-        self.pop_size = pop_size
-        self.is_functional = is_functional
-        self._noop_net_ref = list(noop_net)
-        self._template_ref = list(template)
-        self.specs = list(specs)
-        self._spec_by_name = {s.name: s for s in self.specs}
-        self._state_dict_key_map = list(sd_map)
-        self.clear_grad_tracking()
-
-    def _build_specs(self, ref: Module, *, shared = ()) -> tuple[list[TensorSpec], list[tuple[str, str, bool]]]:
-        named_p = list(ref.named_parameters(remove_duplicate = True))
-        groups = {(rg, sh): [{}, [], 0] for rg in (True, False) for sh in (False, True)}
-        specs: list[TensorSpec] = []
-
-        for name, p in named_p:
-            rg = p.requires_grad
-            sh = self.is_population and matches_pattern(name, shared)
-            buckets, offsets, t_idx = groups[(rg, sh)]
-
-            if p.dtype not in buckets:
-                buckets[p.dtype] = len(buckets)
-                offsets.append(0)
-
-            b = buckets[p.dtype]
-            specs.append(TensorSpec(name, tuple(p.shape), p.numel(), b, offsets[b], rg, t_idx if rg else None, sh))
-            offsets[b] += p.numel()
-            if rg:
-                groups[(rg, sh)][2] = t_idx + 1
-
-        spec_names = {s.name for s in specs}
-        p_ids = {id(p): n for n, p in named_p}
-        b_ids = {id(b): n for n, b in ref.named_buffers(remove_duplicate = True)}
-
-        sd_map = []
-        for k, t in ref.state_dict().items():
-            if id(t) in p_ids:
-                sd_map.append((k, p_ids[id(t)], True))
-            elif id(t) in b_ids:
-                sd_map.append((k, b_ids[id(t)], False))
-            else:
-                sd_map.append((k, k, k in spec_names))
-
-        return specs, sd_map
-
-    @staticmethod
-    def _pack_group(
-        specs: list[TensorSpec],
-        all_params: list[dict[str, Tensor]],
-        *,
-        shared: bool,
-        as_param: bool,
-    ) -> list[Tensor]:
-        num_buckets = max((s.bucket for s in specs), default = -1) + 1
-        out: list[Tensor] = []
-
-        for b in range(num_buckets):
-            bs = [s for s in specs if s.bucket == b]
-            stacked = [torch.stack([mp[s.name].detach() for mp in all_params], dim = 0) for s in bs]
-            if shared:
-                reduced = [t.mean(0) if t.is_floating_point() else t[0] for t in stacked]
-                flat, _ = pack(reduced, '*')
-            else:
-                flat, _ = pack(stacked, 'p *')
-            out.append(Parameter(flat, requires_grad = True) if as_param else flat)
-
-        return out
+    # init & cloning
 
     def init_noop(self, net: Module):
         self.pop_size = None
-        specs, sd_map = self._build_specs(net)
-        self._set_shell(
-            pop_size = None,
-            is_functional = False,
-            noop_net = [net],
-            template = [],
-            specs = specs,
-            sd_map = sd_map,
-        )
-        self._trainable_flats = ParameterList()
-        self._shared_trainable_flats = ParameterList()
-        self._func_trainable_flats = []
-        self._func_shared_flats = []
-        self._functional_opt_states = {}
-        self._frozen_store.clear()
-        self._buffer_store.clear()
+        object.__setattr__(self, '_noop_net', net)
+        object.__setattr__(self, '_template', None)
+        self._schema = _Schema(net)
+        self._func_leaves = None
+        self._active_grads = None
 
     def init_from_modules(self, modules: list[Module], template: Module, *, shared = ()):
         ref = modules[0]
-        all_p = [dict(m.named_parameters(remove_duplicate = True)) for m in modules]
-        all_b = [dict(m.named_buffers(remove_duplicate = True)) for m in modules]
-        ref_p, ref_b = all_p[0], all_b[0]
+        mod_p = [dict(m.named_parameters()) for m in modules]
+        mod_b = [dict(m.named_buffers()) for m in modules]
+        _validate_maps('parameter', mod_p)
+        _validate_maps('buffer', mod_b)
 
-        for idx, (mp, mb) in enumerate(zip(all_p[1:], all_b[1:]), start = 1):
-            if list(mp) != list(ref_p):
-                raise ValueError(f'module {idx} parameter names do not match module 0')
-            if list(mb) != list(ref_b):
-                raise ValueError(f'module {idx} buffer names do not match module 0')
-            for n, p in ref_p.items():
-                if mp[n].shape != p.shape:
-                    raise ValueError(f'parameter {n!r} shape mismatch: {p.shape} vs {mp[n].shape}')
-            for n, b in ref_b.items():
-                if mb[n].shape != b.shape:
-                    raise ValueError(f'buffer {n!r} shape mismatch: {b.shape} vs {mb[n].shape}')
-
+        schema = _Schema(ref, shared)
         self.pop_size = len(modules)
-        specs, sd_map = self._build_specs(ref, shared = shared)
-        self._set_shell(
-            pop_size = len(modules),
-            is_functional = False,
-            noop_net = [],
-            template = [template],
-            specs = specs,
-            sd_map = sd_map,
-        )
-        self._func_trainable_flats = []
-        self._func_shared_flats = []
-        self._functional_opt_states = {}
+        object.__setattr__(self, '_noop_net', None)
+        object.__setattr__(self, '_template', template)
+        self._schema = schema
+        self._func_leaves = None
+        self._active_grads = None
 
-        pop_t = self._pack_group(self.pop_trainable_specs, all_p, shared = False, as_param = True)
-        sh_t = self._pack_group(self.shared_trainable_specs, all_p, shared = True, as_param = True)
-        self._trainable_flats = ParameterList(pop_t)
-        self._shared_trainable_flats = ParameterList(sh_t)
+        self._pop_param = _pack_group(schema.pop_trainable, mod_p, is_shared = False)
+        self._shared_param = _pack_group(schema.shared_trainable, mod_p, is_shared = True)
 
-        self._frozen_store.clear()
-        pop_frozen = [s for s in self.frozen_specs if not s.shared]
-        sh_frozen = [s for s in self.frozen_specs if s.shared]
-        for b, t in enumerate(self._pack_group(pop_frozen, all_p, shared = False, as_param = False)):
-            self._frozen_store.set(f'pop_{b}', t, populated = True)
-        for b, t in enumerate(self._pack_group(sh_frozen, all_p, shared = True, as_param = False)):
-            self._frozen_store.set(f'sh_{b}', t, populated = False)
+        self.store.clear_('frozen/')
+        for s in schema.specs:
+            if s.requires_grad:
+                continue
+            val = torch.stack([mp[s.name].detach().clone() for mp in mod_p])
+            if s.shared:
+                val = val.mean(0) if val.is_floating_point() else val[0]
+            self.store.set(f'frozen/{s.name}', val, populated = not s.shared)
 
-        persistence = named_buffer_persistence(ref)
-        self._buffer_store.clear()
-        for name in ref_b:
-            stacked = torch.stack([mb[name].detach().clone() for mb in all_b], dim = 0)
-            self._buffer_store.set(name, stacked, populated = True, persistent = persistence.get(name, True))
+        sd_keys = set(ref.state_dict())
+        self.store.clear_('buffer/')
+        for name in mod_b[0]:
+            stacked = torch.stack([mb[name].detach().clone() for mb in mod_b])
+            self.store.set(f'buffer/{name}', stacked, populated = True, persistent = name in sd_keys, append_repeat = True)
 
-    def _init_from_sliced(
-        self,
-        *,
-        pop_size: int,
-        template: Module,
-        specs: list[TensorSpec],
-        sd_map: list[tuple[str, str, bool]],
-        trainable_flats: list[Parameter],
-        shared_trainable_flats: list[Parameter],
-        frozen_store: TensorStore,
-        buffer_store: TensorStore,
-    ):
-        self._set_shell(
-            pop_size = pop_size,
-            is_functional = False,
-            noop_net = [],
-            template = [template],
-            specs = specs,
-            sd_map = sd_map,
-        )
-        self._trainable_flats = ParameterList(trainable_flats)
-        self._shared_trainable_flats = ParameterList(shared_trainable_flats)
-        self._func_trainable_flats = []
-        self._func_shared_flats = []
-        self._functional_opt_states = {}
-        self._frozen_store = frozen_store
-        self._buffer_store = buffer_store
-
-    def _spawn_functional(
-        self,
-        trainable_flats: list[Tensor],
-        opt_states: dict[str, FunctionalOptState],
-        shared_flats: list[Tensor] | None = None,
-    ) -> PopulationParameters:
+    def _spawn(self, store: TensorStore, pop_flat: Tensor | None, shared_flat: Tensor | None, *, pop_size = None, template = None, functional: bool = False, clone_opts: bool = True) -> PopulationParameters:
         out = PopulationParameters()
-        out._set_shell(
-            pop_size = self.pop_size,
-            is_functional = True,
-            noop_net = self._noop_net_ref,
-            template = self._template_ref,
-            specs = self.specs,
-            sd_map = self._state_dict_key_map,
-        )
-        out._func_trainable_flats = list(trainable_flats)
-        out._func_shared_flats = list(default(shared_flats, self.param_leaves()[1]))
-        out._frozen_store = self._frozen_store.clone_store()
-        out._buffer_store = self._buffer_store.clone_store()
-        out._functional_opt_states = dict(opt_states)
-        out._opt_owners = {k: list(v) for k, v in self._opt_owners.items()}
-        out._default_opt_name = self._default_opt_name
+        out.pop_size = default(pop_size, self.pop_size)
+        object.__setattr__(out, '_noop_net', self._noop_net)
+        object.__setattr__(out, '_template', default(template, self._template))
+        out._schema = self._schema
+        out._func_leaves = (pop_flat, shared_flat) if functional else None
+        if not functional:
+            out._pop_param = Parameter(pop_flat, requires_grad = True) if exists(pop_flat) else None
+            out._shared_param = Parameter(shared_flat, requires_grad = True) if exists(shared_flat) else None
+        out.store = store
+        if clone_opts:
+            out.opt_stores = {k: v.clone_handle(out) for k, v in self.opt_stores.items()}
+            out._optimizers = dict(self._optimizers)
+            out._default_opt_name = self._default_opt_name
         return out
 
-    # spec & store accessors
+    def sliced(self, indices: list[int] | None = None, *, clone_opts: bool = False) -> PopulationParameters:
+        prefixes = ('frozen/', 'buffer/', 'opt/') if clone_opts else ('frozen/', 'buffer/')
+        store = self.store.clone(detach = True, prefixes = prefixes)
+        if exists(indices):
+            store.keep_(indices, self.pop_size)
+        pop_data = None
+        if exists(self._pop_param):
+            pop_data = slice_pop(self._pop_param, indices) if exists(indices) else self._pop_param.detach().clone()
+        sh_data = self._shared_param.detach().clone() if exists(self._shared_param) else None
+        return self._spawn(store, pop_data, sh_data, pop_size = len(indices) if exists(indices) else self.pop_size, template = deepcopy(self._template), clone_opts = clone_opts)
+
+    def _spawn_functional(self, pop_flat: Tensor | None, shared_flat: Tensor | None) -> PopulationParameters:
+        store = self.store.clone(detach = True, prefixes = ('frozen/', 'buffer/', 'opt/'), shallow_prefixes = ('opt/',))
+        return self._spawn(store, pop_flat, shared_flat, functional = True)
+
+    def clone(self, *, _detach: bool = False) -> PopulationParameters:
+        self._require_pop('detach()' if _detach else 'clone()')
+        if not self.is_functional:
+            return self.sliced(clone_opts = True)
+        pop_t, sh_t = (
+            (t.detach().clone().requires_grad_(True) if _detach else t.clone()) if exists(t) else None
+            for t in self._func_leaves
+        )
+        return self._spawn(self.store.clone(detach = _detach), pop_t, sh_t, functional = True)
+
+    def detach(self) -> PopulationParameters:
+        return self.clone(_detach = True)
+
+    # accessors
 
     @property
     def is_population(self) -> bool:
         return exists(self.pop_size)
 
     @property
-    def has_shared_params(self) -> bool:
-        return any(s.shared for s in self.specs)
+    def is_functional(self) -> bool:
+        return exists(self._func_leaves)
+
+    @property
+    def template(self) -> Module:
+        return self._template if self.is_population else self._noop_net
 
     @property
     def trainable_specs(self) -> list[TensorSpec]:
-        return [s for s in self.specs if s.requires_grad]
+        return self._schema.trainable
 
     @property
-    def pop_trainable_specs(self) -> list[TensorSpec]:
-        return [s for s in self.specs if s.requires_grad and not s.shared]
+    def _pop_leaf(self) -> Tensor | None:
+        return self._func_leaves[0] if exists(self._func_leaves) else self._pop_param
 
     @property
-    def shared_trainable_specs(self) -> list[TensorSpec]:
-        return [s for s in self.specs if s.requires_grad and s.shared]
+    def _shared_leaf(self) -> Tensor | None:
+        return self._func_leaves[1] if exists(self._func_leaves) else self._shared_param
 
     @property
-    def frozen_specs(self) -> list[TensorSpec]:
-        return [s for s in self.specs if not s.requires_grad]
-
-    def has_param(self, name: str) -> bool:
-        return name in self._spec_by_name
-
-    def param_spec(self, name: str) -> TensorSpec:
-        if name not in self._spec_by_name:
-            raise KeyError(f'no parameter named {name!r}')
-        return self._spec_by_name[name]
-
-    def is_shared_param(self, name: str) -> bool:
-        return self.param_spec(name).shared
-
-    @property
-    def num_params(self) -> int:
-        return sum(s.numel for s in self.trainable_specs)
-
-    @property
-    def num_pop_params(self) -> int:
-        return sum(s.numel for s in self.pop_trainable_specs)
-
-    @property
-    def param_names(self) -> list[str]:
-        return [s.name for s in self.specs]
-
-    @property
-    def trainable_param_names(self) -> list[str]:
-        return [s.name for s in self.trainable_specs]
+    def _leaves(self) -> list[Tensor]:
+        return [t for t in (self._pop_leaf, self._shared_leaf) if exists(t)]
 
     @property
     def buffer_names(self) -> list[str]:
-        if not self.is_population:
-            return [n for n, _ in self._noop_net_ref[0].named_buffers(remove_duplicate = True)]
-        return self._buffer_store.keys()
-
-    def param_leaves(self) -> tuple[list[Tensor], list[Tensor]]:
-        if self.is_functional:
-            return list(self._func_trainable_flats), list(self._func_shared_flats)
-        return list(self._trainable_flats), list(self._shared_trainable_flats)
+        entries = self.store.items('buffer/') if self.is_population else self._noop_net.named_buffers()
+        return [k for k, _ in entries]
 
     @property
     def flat_params(self) -> Tensor:
         if not self.is_population:
-            trainable = [p for p in self._noop_net_ref[0].parameters() if p.requires_grad]
-            if not trainable:
-                return torch.empty(0)
+            trainable = [p for p in self._noop_net.parameters() if p.requires_grad]
             if len({p.dtype for p in trainable}) > 1:
                 raise ValueError('flat_params requires a single trainable parameter dtype')
-            return pack(trainable, '*')[0]
-
-        flats = self.param_leaves()[0]
-        if not flats:
-            return torch.empty((self.pop_size, 0))
-        if len(flats) > 1:
-            raise ValueError(f'Population has {len(flats)} trainable parameter dtypes')
-        return flats[0]
+            return pack(trainable, '*')[0] if trainable else torch.empty(0)
+        return self._pop_leaf if exists(self._pop_leaf) else torch.empty((self.pop_size, 0))
 
     @property
     def flat_shared_params(self) -> Tensor | None:
-        flats = self.param_leaves()[1]
-        if not flats:
-            return None
-        if len(flats) > 1:
-            raise ValueError(f'Population has {len(flats)} shared trainable parameter dtypes')
-        return flats[0]
+        return self._shared_leaf
 
-    @property
-    def flat_grad(self) -> Tensor | None:
+    def _require_pop(self, op: str):
         if not self.is_population:
-            trainable = [p for p in self._noop_net_ref[0].parameters() if p.requires_grad]
-            if not any(exists(p.grad) for p in trainable):
-                return None
-            return pack([default(p.grad, torch.zeros_like(p)) for p in trainable], '*')[0]
-        return self.flat_params.grad
+            raise ValueError(f'{op} requires a populated PopulationParameters')
 
-    def _get_store(self, sdict: StoreDict, name: str, factory: Callable[[], Module], *, create: bool, label: str):
-        if name not in sdict:
-            if not create:
-                raise KeyError(f'no {label} named {name!r}')
-            sdict[name] = factory()
-        return sdict[name]
+    def has_param(self, name: str) -> bool:
+        return name in self._schema.by_name
+
+    def is_shared_param(self, name: str) -> bool:
+        return self._schema.by_name[name].shared
 
     def register_opt_store(self, name: str) -> OptStore:
-        return self._get_store(self.opt_stores, name, lambda: OptStore(self), create = True, label = 'optimizer store')
+        return self.opt_stores.setdefault(name, OptStore(self, name))
 
-    def opt_store(self, name: str) -> OptStore:
-        return self._get_store(self.opt_stores, name, lambda: OptStore(self), create = False, label = 'optimizer store')
+    def _opt_key(self, opt = None) -> str | None:
+        return self._default_opt_name if not exists(opt) else (opt if isinstance(opt, str) else opt.name)
 
-    def lane_store(self, name: str, *, create: bool = True) -> TensorStore:
-        return self._get_store(self.lane_stores, name, TensorStore, create = create, label = 'lane store')
+    def _opt_owner(self, opt = None):
+        key = self._opt_key(opt)
+        return self._optimizers.get(key) if exists(key) else None
 
-    def substore(self, name: str, *, create: bool = True) -> TensorStore:
-        return self._get_store(self.substores, name, TensorStore, create = create, label = 'substore')
+    def opt_slot_flat(self, slot: str, opt = None) -> Tensor | None:
+        store = self.opt_stores.get(self._opt_key(opt))
+        return store.get(f'slot/{slot}/pop') if exists(store) else None
 
-    # generic optimizer state accessors (works for Adam, AdamW, SGD, Muon, custom)
+    def opt_aux(self, name: str, param_name: str, opt = None) -> Tensor | None:
+        store = self.opt_stores.get(self._opt_key(opt))
+        return store.get(f'aux/{name}/{param_name}') if exists(store) else None
 
-    def _resolve_opt_key(self, opt: str | PopulationOptimizer | None = None) -> str | None:
-        if not exists(opt):
-            return self._default_opt_name
-        name = opt if isinstance(opt, str) else opt.name
-        stores = self._functional_opt_states if self.is_functional else self.opt_stores
-        if name not in stores:
-            raise KeyError(f'no optimizer named {name!r}')
-        return name
+    def unpack_flat(self, flat: Tensor) -> dict[str, Tensor]:
+        specs = self._schema.pop_trainable if self.is_population else self._schema.trainable
+        return dict(zip((s.name for s in specs), unpack_tensors(flat, [s.shape for s in specs])))
 
-    def _resolve_opt_owner(self, opt: str | PopulationOptimizer | None = None) -> PopulationOptimizer | None:
-        key = self._resolve_opt_key(opt)
-        if not exists(key):
-            return None
-        if key in self._optimizers:
-            return self._optimizers[key]
-        owners = self._opt_owners.get(key)
-        return owners[0] if owners else None
+    # views, autograd & grad zeroing
 
-    def opt_slot_flat(self, slot: str, opt: str | PopulationOptimizer | None = None) -> Tensor | None:
-        key = self._resolve_opt_key(opt)
-        if not exists(key):
-            return None
+    def _param_view(self, spec: TensorSpec) -> Tensor:
+        if not spec.requires_grad:
+            return self.store[f'frozen/{spec.name}']
+        return slice_spec(spec, self._shared_leaf if spec.shared else self._pop_leaf)
 
-        if self.is_functional:
-            flats = self._functional_opt_states[key].slots.get(slot)
+    def _member_tensors(self, idx: int, *, clone: bool = False, track_grads: bool = False):
+        if not self.is_population:
+            params, buffers = self.named_parameters_dict(), self.named_buffers_dict()
         else:
-            store: OptStore = self.opt_stores[key]
-            flats = store.slot_flats(slot) if store.has_slot(slot) else None
+            named = self.named_parameters_dict(track_grads = track_grads)
+            params = {s.name: (named[s.name] if s.shared else named[s.name][idx]) for s in self._schema.specs}
+            buffers = {k: t[idx] for k, t in self.store.items('buffer/')}
+        if not clone:
+            return params, buffers
+        return {k: t.detach().clone() for k, t in params.items()}, {k: t.detach().clone() for k, t in buffers.items()}
 
-        if not flats:
-            return None
-        if len(flats) > 1:
-            raise ValueError('multiple dtype buckets; use named_optimizer_state()')
-        return flats[0]
-
-    def opt_global(self, name: str, opt: str | PopulationOptimizer | None = None) -> Tensor | None:
-        key = self._resolve_opt_key(opt)
-        if not exists(key):
-            return None
-        if self.is_functional:
-            return self._functional_opt_states[key].globals.get(name)
-        store: OptStore = self.opt_stores[key]
-        return store.global_tensor(name) if store.has_global(name) else None
-
-    @property
-    def flat_exp_avg(self) -> Tensor | None:
-        return self.opt_slot_flat('m')
-
-    @property
-    def flat_exp_avg_sq(self) -> Tensor | None:
-        return self.opt_slot_flat('v')
-
-    @property
-    def flat_steps(self) -> Tensor | None:
-        return self.opt_global('steps')
-
-    flat_m = flat_exp_avg
-    flat_v = flat_exp_avg_sq
-
-    # flat parameter-space packing / unpacking
-
-    def pack_named(self, named: Mapping[str, Tensor], *, shared: bool = False) -> tuple[Tensor, Tensor | None]:
-        pop_specs = self.pop_trainable_specs if self.is_population else self.trainable_specs
-        sh_specs = self.shared_trainable_specs if self.is_population else []
-        ref = default(next(iter(named.values()), None), self.flat_params)
-
-        def _get(s: TensorSpec, *, collapse: bool) -> Tensor:
-            v = named.get(s.name)
-            if not exists(v):
-                shape = s.shape if collapse else (self.pop_size, *s.shape)
-                return torch.zeros(shape, device = ref.device, dtype = ref.dtype)
-            if collapse and self.is_population and v.ndim == len(s.shape) + 1:
-                return v.mean(0)
-            return v
-
-        collapse = not self.is_population or shared
-        if pop_specs:
-            pattern = '*' if collapse else 'p *'
-            pop_flat, _ = pack([_get(s, collapse = collapse) for s in pop_specs], pattern)
-        else:
-            shape = (0,) if collapse else (self.pop_size, 0)
-            pop_flat = torch.empty(shape, device = ref.device, dtype = ref.dtype)
-
-        sh_flat = pack([_get(s, collapse = True) for s in sh_specs], '*')[0] if sh_specs else None
-        return pop_flat, sh_flat
-
-    def unpack_flat(self, flat: Tensor, sh_flat: Tensor | None = None) -> dict[str, Tensor]:
-        pop_specs = self.pop_trainable_specs if self.is_population else self.trainable_specs
-        pop_views = unpack_tensors(flat, [s.shape for s in pop_specs])
-        parts = dict(zip((s.name for s in pop_specs), pop_views))
-
-        if not exists(sh_flat):
-            return parts
-
-        sh_specs = self.shared_trainable_specs
-        sh_views = unpack_tensors(sh_flat, [s.shape for s in sh_specs])
-        parts.update(zip((s.name for s in sh_specs), sh_views))
-        return {s.name: parts[s.name] for s in self.trainable_specs if s.name in parts}
-
-    # colocated gradient lanes, EMAs, and meta tensors
-
-    def _upsert_flat(
-        self,
-        store: TensorStore,
-        key: str,
-        value: Tensor,
-        *,
-        decay: float | None = None,
-        members = None,
-        shared: bool = False,
-        source: str = '',
-    ) -> Tensor:
-        val = value.detach()
-        if shared and self.is_population and val.ndim == 2:
-            val = val.mean(0)
-        idx = self.resolve_members(members) if (exists(members) and self.is_population) else None
-        is_pop = self.is_population and not shared and val.ndim == 2
-        return store.upsert_(key, val, decay = decay, idx = idx, pop_size = self.pop_size, source = source, populated = is_pop)
-
-    def set_lane(self, name: str, grad: Tensor | Mapping[str, Tensor]) -> Tensor:
-        flat = self.pack_named(grad)[0] if isinstance(grad, Mapping) else grad
-        expected = self.num_pop_params if self.is_population else self.num_params
-        if flat.shape[-1] != expected:
-            raise ValueError(f'lane {name!r} last dim must be {expected}, got shape {tuple(flat.shape)}')
-        self.lanes[name] = flat
-        return flat
-
-    def lane(self, name: str) -> Tensor:
-        if name not in self.lanes:
-            raise KeyError(f'no gradient lane named {name!r}')
-        return self.lanes[name]
-
-    def clear_lanes(self, names: str | Sequence[str] | None = None):
-        if not exists(names):
-            self.lanes.clear()
+    def _copy_grad_(self, spec: TensorSpec, dst_param: Tensor, grad: Tensor, idx: int):
+        if not self.is_population:
+            dst_param.grad = grad.detach().clone()
             return
-        targets = (names,) if isinstance(names, str) else names
-        for n in targets:
-            self.lanes.pop(n, None)
+        leaf = self._shared_leaf if spec.shared else self._pop_leaf
+        if not exists(leaf.grad):
+            leaf.grad = torch.zeros_like(leaf)
+        g_dst = slice_spec(spec, leaf.grad)
+        if not spec.shared:
+            g_dst = g_dst[idx]
+        g_dst.copy_(grad.detach().to(g_dst))
+        if exists(self._active_grads):
+            self._active_grads.add(spec.name)
 
-    def update_lane_ema(
-        self,
-        lane: str,
-        key: str = 'ema',
-        decay: float = 0.9,
-        *,
-        members = None,
-        shared: bool = False,
-        source_tensor: Tensor | None = None,
-    ) -> Tensor:
-        src = source_tensor if exists(source_tensor) else self.lane(lane)
-        return self._upsert_flat(self.lane_store(lane), key, src, decay = decay, members = members, shared = shared, source = lane)
+    def _copy_member_state_(self, idx: int, src_p: Mapping[str, Tensor] | None, src_b: Mapping[str, Tensor] | None, *, check_shapes: bool = False, skip_shared: bool = False, sync_grads: bool = False):
+        if exists(src_p):
+            for name, dst in self.named_parameters_dict().items():
+                spec = self._schema.by_name[name]
+                if (skip_shared and spec.shared) or name not in src_p:
+                    continue
+                src = src_p[name]
+                target = dst[idx] if (self.is_population and not spec.shared) else dst
+                _copy_tensor_(target, src, 'parameter', name, check_shapes)
+                if sync_grads and spec.requires_grad and exists(src.grad):
+                    self._copy_grad_(spec, dst, src.grad, idx)
 
-    def update_lane_var(
-        self,
-        lane: str,
-        key: str = 'var',
-        decay: float = 0.99,
-        *,
-        members = None,
-        shared: bool = False,
-        source_tensor: Tensor | None = None,
-    ) -> Tensor:
-        g = (source_tensor if exists(source_tensor) else self.lane(lane)).detach()
-        return self.update_lane_ema(lane, key = key, decay = decay, members = members, shared = shared, source_tensor = g * g)
-
-    def lane_meta(self, lane: str) -> dict[str, Tensor]:
-        return self.lane_stores[lane].as_dict() if lane in self.lane_stores else {}
-
-    def clear_lane_meta(self, lane: str | None = None, key: str | None = None, *, members = None):
-        idx = self.resolve_members(members) if exists(members) else None
-        targets = [lane] if exists(lane) else list(self.lane_stores.keys())
-        for lname in targets:
-            if lname in self.lane_stores:
-                self.lane_stores[lname].clear_keys_(key, indices = idx, pop_size = self.pop_size)
-
-    def update_ema(
-        self,
-        tag: str,
-        source: str | Tensor,
-        decay: float = 0.99,
-        *,
-        members = None,
-        shared: bool = False,
-    ) -> Tensor:
-        if is_tensor(source):
-            src_t, src_key = source, ''
-        elif source == 'params':
-            src_t, src_key = self.flat_params, 'params'
-        elif source.startswith('grad.'):
-            src_t, src_key = self.lane(source[5:]), source
-        elif source in self.lanes:
-            src_t, src_key = self.lanes[source], f'grad.{source}'
-        else:
-            raise KeyError(f"unknown EMA source {source!r}; expected 'params', 'grad.<lane>', a lane name, or a Tensor")
-        return self._upsert_flat(self.ema_store, tag, src_t, decay = decay, members = members, shared = shared, source = src_key)
-
-    def ema(self, tag: str) -> Tensor:
-        if tag not in self.ema_store:
-            raise KeyError(f'no EMA named {tag!r}')
-        return self.ema_store[tag]
-
-    @property
-    def emas(self) -> dict[str, Tensor]:
-        return self.ema_store.as_dict()
-
-    def clear_ema(self, tag: str | None = None, *, members = None):
-        idx = self.resolve_members(members) if exists(members) else None
-        self.ema_store.clear_keys_(tag, indices = idx, pop_size = self.pop_size)
-
-    def set_meta(self, name: str, value: Tensor, *, members = None) -> Tensor:
-        idx = self.resolve_members(members) if (exists(members) and self.is_population) else None
-        return self.meta_store.upsert_(name, value, idx = idx, pop_size = self.pop_size)
-
-    def ema_meta(self, name: str, value: Tensor, decay: float = 0.95, *, members = None) -> Tensor:
-        self.set_meta(name, value, members = members)
-        idx = self.resolve_members(members) if (exists(members) and self.is_population) else None
-        return self.meta_store.upsert_(f'ema.{name}', value, decay = decay, idx = idx, pop_size = self.pop_size)
-
-    @property
-    def meta(self) -> dict[str, Tensor]:
-        return self.meta_store.as_dict()
-
-    def clear_meta(self, name: str | None = None, *, members = None):
-        idx = self.resolve_members(members) if exists(members) else None
-        keys = {name, f'ema.{name}'} if exists(name) else None
-        self.meta_store.clear_keys_(keys, indices = idx, pop_size = self.pop_size)
-
-    # zero-copy structured views & direct param sync
-
-    def clear_grad_tracking(self):
-        self._tracking_active_grads = False
-        self._active_grad_params.clear()
-
-    def _param_flat_for(self, spec: TensorSpec) -> Tensor:
-        t_flats, st_flats = self.param_leaves()
-        if spec.shared:
-            return st_flats[spec.bucket] if spec.requires_grad else self._frozen_store[f'sh_{spec.bucket}']
-        return t_flats[spec.bucket] if spec.requires_grad else self._frozen_store[f'pop_{spec.bucket}']
-
-    def copy_param_from_(self, name: str, value: Tensor, *, index: int | None = None, grad: Tensor | None = None):
-        with torch.no_grad():
-            if not self.is_population:
-                dst = dict(self._noop_net_ref[0].named_parameters(remove_duplicate = True))[name]
-                dst.copy_(value.detach().to(dst))
-                if exists(grad):
-                    dst.grad = grad.detach().clone()
-                return
-
-            spec = self.param_spec(name)
-            flat = self._param_flat_for(spec)
-            use_idx = index if not spec.shared else None
-            dst = slice_spec(spec, flat, idx = use_idx, pop_size = self.pop_size)
-            dst.copy_(value.detach().to(dst))
-
-            if exists(grad) and spec.requires_grad:
-                if not exists(flat.grad):
-                    flat.grad = torch.zeros_like(flat)
-                gdst = slice_spec(spec, flat.grad, idx = use_idx, pop_size = self.pop_size)
-                gdst.copy_(grad.detach().to(gdst))
-                self._active_grad_params.add(name)
+        if exists(src_b):
+            for name, dst in self.named_buffers_dict().items():
+                if name in src_b:
+                    target = dst[idx] if self.is_population else dst
+                    _copy_tensor_(target, src_b[name], 'buffer', name, check_shapes)
 
     def named_parameters_dict(self, *, track_grads: bool = False) -> dict[str, Tensor]:
         if not self.is_population:
-            return dict(self._noop_net_ref[0].named_parameters(remove_duplicate = True))
+            return dict(self._noop_net.named_parameters())
 
-        should_hook = track_grads and torch.is_grad_enabled() and not self.is_functional
-        if should_hook:
-            self._tracking_active_grads = True
+        # track which parameter slices actually receive gradients during backward
+        hook = track_grads and torch.is_grad_enabled() and not self.is_functional
+        if hook and not exists(self._active_grads):
+            self._active_grads = set()
 
-        out = {}
-        for s in self.specs:
-            view = slice_spec(s, self._param_flat_for(s), pop_size = self.pop_size)
-            if should_hook and s.requires_grad and view.requires_grad:
-                view.register_hook(lambda _g, n = s.name: self._active_grad_params.add(n))
-            out[s.name] = view
-        return out
-
-    def batched_parameters_dict(self, *, members = None, track_grads: bool = False) -> dict[str, Tensor]:
-        named = self.named_parameters_dict(track_grads = track_grads)
-        if not self.is_population:
-            return named
-
-        idx = self.resolve_members(members) if exists(members) else None
-        n = len(idx) if exists(idx) else self.pop_size
-        if not exists(idx) and not self.has_shared_params:
-            return named
-
-        out = {}
-        for s in self.specs:
-            t = named[s.name]
-            if s.shared:
-                out[s.name] = t.unsqueeze(0).expand(n, *s.shape)
-            else:
-                out[s.name] = t[idx] if exists(idx) else t
-        return out
-
-    def batched_buffers_dict(self, *, members = None) -> dict[str, Tensor]:
-        bufs = self.named_buffers_dict()
-        if not self.is_population or not exists(members):
-            return bufs
-        idx = self.resolve_members(members)
-        return {n: b[idx] for n, b in bufs.items()}
+        named = {}
+        for s in self._schema.specs:
+            v = self._param_view(s)
+            if hook and s.requires_grad and v.requires_grad:
+                v.register_hook(lambda _g, n = s.name: self._active_grads.add(n) if exists(self._active_grads) else None)
+            named[s.name] = v
+        return named
 
     def named_grads_dict(self) -> dict[str, Tensor | None]:
         if not self.is_population:
-            return {n: p.grad for n, p in self._noop_net_ref[0].named_parameters(remove_duplicate = True)}
-
-        t_flats, st_flats = self.param_leaves()
+            return {n: p.grad for n, p in self._noop_net.named_parameters()}
         out = {}
-        for s in self.specs:
-            gf = (st_flats[s.bucket].grad if s.shared else t_flats[s.bucket].grad) if s.requires_grad else None
-            if not exists(gf) or (self._tracking_active_grads and s.name not in self._active_grad_params):
-                out[s.name] = None
-            else:
-                out[s.name] = slice_spec(s, gf, pop_size = self.pop_size)
+        for s in self._schema.specs:
+            leaf = (self._shared_leaf if s.shared else self._pop_leaf) if s.requires_grad else None
+            g = leaf.grad if exists(leaf) else None
+            inactive = exists(self._active_grads) and s.name not in self._active_grads
+            out[s.name] = None if (not exists(g) or inactive) else slice_spec(s, g)
         return out
 
     def named_buffers_dict(self) -> dict[str, Tensor]:
-        if not self.is_population:
-            return dict(self._noop_net_ref[0].named_buffers(remove_duplicate = True))
-        return self._buffer_store.as_dict()
+        return self.store.as_dict('buffer/') if self.is_population else dict(self._noop_net.named_buffers())
 
-    def named_optimizer_state(self, opt: str | PopulationOptimizer | None = None) -> dict[str, dict[str, Tensor]] | None:
-        owner = self._resolve_opt_owner(opt)
+    def named_optimizer_state(self, opt = None) -> dict[str, dict[str, Tensor]] | None:
+        owner = self._opt_owner(opt)
         return owner.named_state(self) if exists(owner) else None
 
-    def optimizer_state_dict(self, opt: str | PopulationOptimizer | None = None) -> dict | None:
-        owner = self._resolve_opt_owner(opt)
-        return owner.state_dict_for(self) if exists(owner) else None
-
-    def _build_state_dict(self, named_p: Mapping[str, Tensor], named_b: Mapping[str, Tensor]) -> dict[str, Tensor]:
-        out = {}
-        for sd_k, canon, is_param in self._state_dict_key_map:
-            table = named_p if is_param else named_b
-            if canon in table:
-                out[sd_k] = table[canon]
-        return out
-
-    def as_dict(self, opt: str | PopulationOptimizer | None = None) -> dict:
-        named_p = self.named_parameters_dict()
-        named_b = self.named_buffers_dict()
-        return {
-            'parameters': list(named_p.values()),
-            'named_parameters': named_p,
-            'buffers': list(named_b.values()),
-            'named_buffers': named_b,
-            'optimizer_state': self.optimizer_state_dict(opt),
-            'named_optimizer_state': self.named_optimizer_state(opt),
-        }
-
-    # indexing & PyTorch-compatible single-individual dicts
-
-    def _normalize_index(self, index: int | Tensor) -> int:
-        idx = int(index.item()) if is_tensor(index) else int(index)
-        size = self.pop_size if self.is_population else 1
-        idx = idx + size if idx < 0 else idx
-        if not (0 <= idx < size):
-            raise IndexError(f'individual index {index} out of range for population of size {size}')
-        return idx
-
-    def resolve_members(self, selector) -> list[int]:
-        size = self.pop_size if self.is_population else 1
-        if is_int_index(selector):
-            return [self._normalize_index(selector)]
-        if isinstance(selector, slice):
-            return list(range(size))[selector]
-        if is_tensor(selector):
-            if selector.dtype == torch.bool:
-                if selector.ndim != 1 or selector.numel() != size:
-                    raise ValueError(f'boolean mask must have shape ({size},), got {tuple(selector.shape)}')
-                return selector.nonzero(as_tuple = False).flatten().tolist()
-            if selector.ndim != 1 or selector.is_floating_point():
-                raise IndexError(f'index tensor must be 1D integer or bool, got shape {tuple(selector.shape)}, dtype {selector.dtype}')
-            return [self._normalize_index(int(i)) for i in selector.tolist()]
-        if isinstance(selector, Sequence) and not isinstance(selector, (str, bytes)):
-            return [self._normalize_index(i) for i in selector]
-        raise TypeError(f'unsupported selector type {type(selector).__name__}')
-
-    def individual(
-        self,
-        index: int = 0,
-        *,
-        opt: str | PopulationOptimizer | None = None,
-        clone: bool = False,
-    ) -> dict:
-        idx = self._normalize_index(index)
-        maybe = (lambda t: t.detach().clone()) if clone else (lambda t: t)
+    def autograd(self, loss: Tensor, *, names: Iterable[str] | None = None, retain_graph: bool | None = None, create_graph: bool = False) -> dict[str, Tensor]:
+        trainable = self._schema.trainable
+        active = set(names) if exists(names) else {s.name for s in trainable}
+        kw = {'retain_graph': default(retain_graph, create_graph), 'create_graph': create_graph, 'allow_unused': True}
 
         if not self.is_population:
-            net = self._noop_net_ref[0]
-            named_p = {n: maybe(p) for n, p in net.named_parameters(remove_duplicate = True)}
-            named_b = {n: maybe(b) for n, b in net.named_buffers(remove_duplicate = True)}
-        else:
-            named_p = {s.name: maybe(slice_spec(s, self._param_flat_for(s), idx = idx)) for s in self.specs}
-            named_b = {n: maybe(b[idx]) for n, b in self._buffer_store.items()}
+            named = self.named_parameters_dict()
+            keys = [s.name for s in trainable if s.name in active]
+            raw = dict(zip(keys, torch_grad(loss, [named[k] for k in keys], **kw))) if keys else {}
+            return {s.name: default(raw.get(s.name), torch.zeros_like(named[s.name])) for s in trainable}
 
-        owner = self._resolve_opt_owner(opt)
-        if exists(owner):
-            named_opt, opt_sd = owner.individual_state(self, idx if self.is_population else None, clone = clone)
-        else:
-            named_opt, opt_sd = None, None
+        need_pop = any(s.name in active and not s.shared for s in trainable) and exists(self._pop_leaf)
+        need_sh = any(s.name in active and s.shared for s in trainable) and exists(self._shared_leaf)
+        targets = ([self._pop_leaf] if need_pop else []) + ([self._shared_leaf] if need_sh else [])
+        raw = torch_grad(loss, targets, **kw) if targets else ()
+        pop_g = raw[0] if need_pop else None
+        sh_g = raw[-1] if need_sh else None
 
+        out = {}
+        for s in trainable:
+            g = (sh_g if s.shared else pop_g) if s.name in active else None
+            out[s.name] = slice_spec(s, g) if exists(g) else torch.zeros_like(self._param_view(s))
+        return out
+
+    def zero_grad_(self, members = None, set_to_none: bool = True):
+        idx = self.resolve_members(members) if exists(members) else None
+        if exists(idx) and not idx:
+            return
+        if exists(idx) and self.is_population:
+            with torch.no_grad():
+                if exists(self._pop_leaf) and exists(self._pop_leaf.grad):
+                    self._pop_leaf.grad[idx] = 0.
+            return
+
+        for p in (self._leaves if self.is_population else self._noop_net.parameters()):
+            if set_to_none:
+                p.grad = None
+            elif exists(p.grad):
+                p.grad.zero_()
+        self._active_grads = None
+
+    # indexing & PyTorch-compatible dicts
+
+    def _bundle(self, named_p, named_b, *, state_dict = False, **extra) -> dict:
         out = {
-            'parameters': list(named_p.values()),
-            'named_parameters': named_p,
-            'buffers': list(named_b.values()),
-            'named_buffers': named_b,
-            'state_dict': self._build_state_dict(named_p, named_b),
-            'optimizer_state': opt_sd,
-            'named_optimizer_state': named_opt,
+            'parameters': list(named_p.values()), 'named_parameters': named_p,
+            'buffers': list(named_b.values()), 'named_buffers': named_b, **extra,
         }
-
-        if self.lanes:
-            out['lanes'] = {
-                k: self.unpack_flat(maybe(v[idx] if (self.is_population and v.ndim == 2) else v))
-                for k, v in self.lanes.items()
-            }
-        if len(self.ema_store):
-            out['emas'] = {
-                k: self.unpack_flat(maybe(v[idx] if (self.is_population and v.ndim == 2) else v))
-                for k, v in self.ema_store.items()
-            }
-        if len(self.meta_store):
-            out['meta'] = {
-                k: maybe(v[idx] if self.meta_store.is_populated(k, self.pop_size) else v)
-                for k, v in self.meta_store.items()
+        if state_dict:
+            out['state_dict'] = {
+                sd_k: (named_p if is_p else named_b)[canon]
+                for sd_k, canon, is_p in self._schema.state_dict_map
+                if canon in (named_p if is_p else named_b)
             }
         return out
 
-    def load_individual_dict_(
-        self,
-        index: int,
-        data: Mapping,
-        *,
-        opt: str | PopulationOptimizer | None = None,
-    ) -> PopulationParameters:
+    def as_dict(self, opt = None) -> dict:
+        owner = self._opt_owner(opt)
+        return self._bundle(
+            self.named_parameters_dict(), self.named_buffers_dict(),
+            optimizer_state = owner.state_dict_for(self) if exists(owner) else None,
+            named_optimizer_state = owner.named_state(self) if exists(owner) else None,
+        )
+
+    def _normalize_index(self, index) -> int:
+        return normalize_index(index, len(self))
+
+    def resolve_members(self, selector, *, non_empty: bool = False) -> list[int]:
+        return resolve_indices(selector, len(self), non_empty = non_empty)
+
+    def individual(self, index: int = 0, *, opt = None, clone: bool = False) -> dict:
+        idx = self._normalize_index(index)
+        params, buffers = self._member_tensors(idx, clone = clone)
+        owner = self._opt_owner(opt)
+        opt_idx = idx if self.is_population else None
+        return self._bundle(
+            params, buffers, state_dict = True,
+            optimizer_state = owner.state_dict_for(self, idx = opt_idx, clone = clone) if exists(owner) else None,
+            named_optimizer_state = owner.named_state(self, idx = opt_idx, clone = clone) if exists(owner) else None,
+        )
+
+    @torch.no_grad()
+    def load_individual_dict_(self, index: int, data: Mapping, *, opt = None, sync_grads: bool = False) -> PopulationParameters:
         idx = self._normalize_index(index)
         sd = data.get('state_dict', {})
-        src_p = data.get('named_parameters') or ({s.name: sd[s.name] for s in self.specs if s.name in sd} if sd else None)
-        src_b = data.get('named_buffers') or ({n: sd[n] for n in self.buffer_names if n in sd} if sd else None)
+        src_p = data.get('named_parameters') or {s.name: sd[s.name] for s in self._schema.specs if s.name in sd}
+        src_b = data.get('named_buffers') or {k: sd[k] for k in self.buffer_names if k in sd}
+        self._copy_member_state_(idx, src_p, src_b, check_shapes = True, sync_grads = sync_grads)
 
-        with torch.no_grad():
-            if exists(src_p):
-                for s in self.specs:
-                    if s.name in src_p:
-                        if tuple(src_p[s.name].shape) != s.shape:
-                            raise ValueError(f'parameter {s.name!r} shape mismatch: {s.shape} vs {tuple(src_p[s.name].shape)}')
-                        self.copy_param_from_(s.name, src_p[s.name], index = idx)
-
-            if exists(src_b):
-                for n, dst in self.named_buffers_dict().items():
-                    if n in src_b:
-                        target = dst[idx] if self.is_population else dst
-                        if tuple(src_b[n].shape) != tuple(target.shape):
-                            raise ValueError(f'buffer {n!r} shape mismatch: {tuple(target.shape)} vs {tuple(src_b[n].shape)}')
-                        target.copy_(src_b[n].detach().to(target))
-
-            if exists(data.get('named_optimizer_state')) or exists(data.get('optimizer_state')):
-                owner = self._resolve_opt_owner(opt)
-                if not exists(owner):
-                    raise ValueError('no attached optimizer on PopulationParameters to load optimizer_state into')
-                owner.load_individual_state_dict_(self, idx, data)
-
+        if exists(data.get('named_optimizer_state')) or exists(data.get('optimizer_state')):
+            owner = self._opt_owner(opt)
+            if not exists(owner):
+                raise ValueError('no attached optimizer on PopulationParameters to load optimizer_state into')
+            owner.load_individual_state_dict_(self, idx, data)
         return self
 
     def __len__(self) -> int:
@@ -864,57 +468,10 @@ class PopulationParameters(Module):
 
     def __setitem__(self, index: int, value: Mapping):
         if not isinstance(value, Mapping):
-            raise TypeError(f'PopulationParameters item assignment expects a dict/Mapping, got {type(value).__name__}')
+            raise TypeError(f'item assignment expects a dict/Mapping, got {type(value).__name__}')
         self.load_individual_dict_(index, value)
 
-    # lifecycle ops (DiscoRL / TBPTT / EMA / PBT dynamic resizing)
-
-    def _dynamic_stores(self) -> tuple[TensorStore, ...]:
-        return (
-            *self.opt_stores.values(),
-            self.ema_store,
-            self.meta_store,
-            *self.lane_stores.values(),
-            *self.substores.values(),
-        )
-
-    def detach(self) -> PopulationParameters:
-        if not self.is_population:
-            raise ValueError('detach() is intended for populated PopulationParameters')
-        if not self.is_functional:
-            return self.clone()
-        return self._spawn_functional(
-            [f.detach().clone().requires_grad_(True) for f in self._func_trainable_flats],
-            {n: st.map_tensors(lambda t: t.detach().clone()) for n, st in self._functional_opt_states.items()},
-            shared_flats = [f.detach().clone().requires_grad_(True) for f in self._func_shared_flats],
-        )
-
-    def clone(self) -> PopulationParameters:
-        if not self.is_population:
-            raise ValueError('clone() requires a populated PopulationParameters')
-        if self.is_functional:
-            return self._spawn_functional(
-                [f.clone() for f in self._func_trainable_flats],
-                {n: st.map_tensors(lambda t: t.clone()) for n, st in self._functional_opt_states.items()},
-                shared_flats = [f.clone() for f in self._func_shared_flats],
-            )
-
-        out = PopulationParameters()
-        out._init_from_sliced(
-            pop_size = self.pop_size,
-            template = deepcopy(self._template_ref[0]),
-            specs = self.specs,
-            sd_map = self._state_dict_key_map,
-            trainable_flats = [Parameter(f.detach().clone(), requires_grad = True) for f in self._trainable_flats],
-            shared_trainable_flats = [Parameter(f.detach().clone(), requires_grad = True) for f in self._shared_trainable_flats],
-            frozen_store = self._frozen_store.clone_store(),
-            buffer_store = self._buffer_store.clone_store(),
-        )
-        for name, store in self.opt_stores.items():
-            out.opt_stores[name] = store.clone_for(out)
-        out._opt_owners = {k: list(v) for k, v in self._opt_owners.items()}
-        out._default_opt_name = self._default_opt_name
-        return out
+    # lifecycle ops
 
     def mean_dict(self, weights: Tensor | Sequence[float] | None = None) -> dict:
         if not self.is_population:
@@ -922,277 +479,140 @@ class PopulationParameters(Module):
 
         w = None
         if exists(weights):
-            w = weights.detach().float() if is_tensor(weights) else torch.tensor([float(v) for v in weights], dtype = torch.float32)
-            if w.ndim != 1 or w.shape[0] != self.pop_size:
+            w = weights.detach().float() if is_tensor(weights) else torch.tensor([float(x) for x in weights])
+            if w.shape != (self.pop_size,):
                 raise ValueError(f'weights must have shape ({self.pop_size},), got {tuple(w.shape)}')
 
-        def _red(t: Tensor) -> Tensor:
-            td = t.detach()
-            if not td.is_floating_point():
-                return td[0].clone()
-            if not exists(w):
-                return td.mean(0)
-            flat, ps = pack([td], 'p *')
-            return unpack(w.to(td) @ flat, ps, '*')[0]
+        def reduce_t(t: Tensor) -> Tensor:
+            t = t.detach()
+            if not t.is_floating_point():
+                return t[0].clone()
+            return torch.tensordot(w.to(t), t, dims = 1) if exists(w) else t.mean(0)
 
-        named_p = {}
-        for s in self.specs:
-            view = slice_spec(s, self._param_flat_for(s), pop_size = self.pop_size)
-            named_p[s.name] = view.detach().clone() if s.shared else _red(view)
+        named_p = {s.name: (self._param_view(s).detach().clone() if s.shared else reduce_t(self._param_view(s))) for s in self._schema.specs}
+        named_b = {k: reduce_t(b) for k, b in self.store.items('buffer/')}
+        return self._bundle(named_p, named_b, state_dict = True)
 
-        named_b = {n: _red(b) for n, b in self._buffer_store.items()}
-        return {
-            'parameters': list(named_p.values()),
-            'named_parameters': named_p,
-            'buffers': list(named_b.values()),
-            'named_buffers': named_b,
-            'state_dict': self._build_state_dict(named_p, named_b),
-        }
-
+    @torch.no_grad()
     def lerp_(self, other: PopulationParameters, weight: float) -> PopulationParameters:
-        with torch.no_grad():
-            t_d, st_d = self.param_leaves()
-            t_s, st_s = other.param_leaves()
-            pairs = [
-                *zip(t_d, t_s),
-                *zip(st_d, st_s),
-                *((self._frozen_store[k], other._frozen_store[k]) for k in self._frozen_store if k in other._frozen_store),
-                *((self._buffer_store[k], other._buffer_store[k]) for k in self._buffer_store if k in other._buffer_store),
-            ]
-            for dst, src in pairs:
-                if dst.is_floating_point():
-                    dst.lerp_(src.detach().to(dst), weight)
+        for dst, src in zip(self._leaves, other._leaves):
+            if dst.is_floating_point():
+                dst.lerp_(src.detach().to(dst), weight)
+        for k in self.store:
+            if not k.startswith(('frozen/', 'buffer/')):
+                continue
+            src = other.store.get(k)
+            dst = self.store[k]
+            if exists(src) and dst.is_floating_point():
+                dst.lerp_(src.detach().to(dst), weight)
         return self
 
+    @torch.no_grad()
     def copy_from_(self, other: PopulationParameters, *, members = None, include_opt: bool = True) -> PopulationParameters:
-        idx = self.resolve_members(members) if exists(members) else None
+        idx = self.resolve_members(members) if (exists(members) and self.is_population) else None
         if exists(idx) and not idx:
             return self
-
-        with torch.no_grad():
-            t_d, st_d = self.param_leaves()
-            t_s, st_s = other.param_leaves()
-            for dst, src in zip(t_d, t_s):
-                val = src.detach().to(dst)
-                if exists(idx) and self.is_population:
-                    dst[idx] = val[idx]
-                else:
-                    dst.copy_(val)
-
-            if not exists(idx):
-                for dst, src in zip(st_d, st_s):
-                    dst.copy_(src.detach().to(dst))
-
-            self._frozen_store.copy_from_(other._frozen_store, indices = idx, pop_size = self.pop_size)
-            self._buffer_store.copy_from_(other._buffer_store, indices = idx, pop_size = self.pop_size)
-
-            if include_opt:
-                for opt_name, dst_store in self.opt_stores.items():
-                    if other.is_functional and opt_name in other._functional_opt_states:
-                        dst_store.copy_from_functional_(other._functional_opt_states[opt_name], indices = idx, pop_size = self.pop_size)
-                    elif not other.is_functional and opt_name in other.opt_stores:
-                        dst_store.copy_from_(other.opt_stores[opt_name], indices = idx, pop_size = self.pop_size)
+        if exists(self._pop_leaf) and exists(other._pop_leaf):
+            cast = other._pop_leaf.detach().to(self._pop_leaf)
+            if exists(idx):
+                self._pop_leaf[idx] = cast[idx]
+            else:
+                self._pop_leaf.copy_(cast)
+        if not exists(idx) and exists(self._shared_leaf) and exists(other._shared_leaf):
+            self._shared_leaf.copy_(other._shared_leaf.detach().to(self._shared_leaf))
+        prefixes = ('frozen/', 'buffer/', 'opt/') if include_opt else ('frozen/', 'buffer/')
+        self.store.copy_from_(other.store, prefixes = prefixes, indices = idx, pop_size = self.pop_size)
         return self
 
-    def reset_(
-        self,
-        selector = None,
-        *,
-        init: Literal['reinit'] | Callable[[Module], None] = 'reinit',
-        reset_opt: bool = True,
-        reset_buffers: bool = True,
-    ) -> PopulationParameters:
+    def _reset_opts_(self, indices: list[int] | None):
+        for store in self.opt_stores.values():
+            store.reset_members_(indices)
+
+    @torch.no_grad()
+    def reset_(self, selector = None, *, init: Literal['reinit'] | Callable[[Module], None] = 'reinit', reset_opt: bool = True, reset_buffers: bool = True) -> PopulationParameters:
         if not self.is_population:
-            net = self._noop_net_ref[0]
-            init(net) if callable(init) else reset_module_parameters(net)
+            init_module(self._noop_net, init)
             if reset_opt:
-                for store in self.opt_stores.values():
-                    store.reset_members_(None)
+                self._reset_opts_(None)
             return self
 
-        indices = list(range(self.pop_size)) if not exists(selector) else self.resolve_members(selector)
-        if not indices:
+        idx = list(range(self.pop_size)) if not exists(selector) else self.resolve_members(selector)
+        if not idx:
             return self
 
-        with torch.no_grad():
-            for idx in indices:
-                ind = self.individual(idx, clone = True)
-                fresh = materialize_from_template(self._template_ref[0], ind['named_parameters'], ind['named_buffers'], training = True)
-                init(fresh) if callable(init) else reset_module_parameters(fresh)
+        for i in idx:
+            fresh = clone_template(self._template, *self._member_tensors(i), training = True)
+            init_module(fresh, init)
+            fresh_b = dict(fresh.named_buffers()) if reset_buffers else None
+            self._copy_member_state_(i, dict(fresh.named_parameters()), fresh_b, skip_shared = True)
 
-                fresh_p = dict(fresh.named_parameters(remove_duplicate = True))
-                for s in self.specs:
-                    if not s.shared:
-                        self.copy_param_from_(s.name, fresh_p[s.name], index = idx)
-
-                if reset_buffers:
-                    fresh_b = dict(fresh.named_buffers(remove_duplicate = True))
-                    for n, dst in self._buffer_store.items():
-                        dst[idx].copy_(fresh_b[n].detach().to(dst))
-
-            if reset_opt:
-                if self.is_functional:
-                    for fstate in self._functional_opt_states.values():
-                        fstate.reset_members_(indices)
-                else:
-                    for store in self.opt_stores.values():
-                        store.reset_members_(indices)
-
-            t_flats = self.param_leaves()[0]
-            for tag, ebuf in self.ema_store.items():
-                if not self.ema_store.is_populated(tag, self.pop_size):
-                    continue
-                if self.ema_store.source_of(tag) == 'params' and len(t_flats) == 1:
-                    ebuf[indices] = t_flats[0][indices].detach().to(ebuf)
-                else:
-                    ebuf[indices] = 0.
-
-            self.meta_store.reset_(indices, pop_size = self.pop_size)
-            for lstore in self.lane_stores.values():
-                lstore.reset_(indices, pop_size = self.pop_size)
+        if reset_opt:
+            self._reset_opts_(idx)
         return self
 
-    def _extract_source(self, source) -> tuple[dict[str, Tensor], dict[str, Tensor] | None]:
+    def _extract_source(self, source):
         if is_int_index(source):
-            ind = self.individual(self._normalize_index(source), clone = True)
-            return ind['named_parameters'], ind['named_buffers']
+            return self._member_tensors(self._normalize_index(source), clone = True)
         if isinstance(source, Module):
-            return dict(source.named_parameters(remove_duplicate = True)), dict(source.named_buffers(remove_duplicate = True))
+            return dict(source.named_parameters()), dict(source.named_buffers())
         if isinstance(source, Mapping):
             if 'named_parameters' in source:
                 return dict(source['named_parameters']), source.get('named_buffers')
             return dict(source), None
         if hasattr(source, 'items'):
             return dict(source.items()), None
-        raise TypeError(f'source must be a member index, nn.Module, or parameter mapping, got {type(source).__name__}')
+        raise TypeError(f'source must be member index, nn.Module, or param mapping, got {type(source).__name__}')
 
-    def replace_(
-        self,
-        index: int,
-        source,
-        *,
-        reset_opt: bool = True,
-        reset_ema: bool = False,
-        reset_meta: bool = False,
-        reset_lanes: bool = False,
-    ) -> PopulationParameters:
-        if not self.is_population:
-            raise ValueError('replace_() requires a populated PopulationParameters')
-
+    @torch.no_grad()
+    def replace_(self, index: int, source, *, reset_opt: bool = True) -> PopulationParameters:
+        self._require_pop('replace_()')
         idx = self._normalize_index(index)
-        src_p, src_b = self._extract_source(source)
-
-        with torch.no_grad():
-            for s in self.specs:
-                if not s.shared and s.name in src_p:
-                    self.copy_param_from_(s.name, src_p[s.name], index = idx)
-
-            if exists(src_b):
-                for n, dst in self._buffer_store.items():
-                    if n in src_b:
-                        dst[idx].copy_(src_b[n].detach().to(dst))
-
-            if reset_opt:
-                for store in self.opt_stores.values():
-                    store.reset_members_([idx])
-            if reset_ema:
-                self.clear_ema(members = [idx])
-            if reset_meta:
-                self.clear_meta(members = [idx])
-            if reset_lanes:
-                for lf in self.lanes.values():
-                    if lf.ndim >= 1 and lf.shape[0] == self.pop_size:
-                        lf[idx] = 0.
-                self.clear_lane_meta(members = [idx])
+        self._copy_member_state_(idx, *self._extract_source(source), skip_shared = True)
+        if reset_opt:
+            self._reset_opts_([idx])
         return self
 
+    def _finish_resize(self, new_size: int):
+        self.pop_size = new_size
+        self._active_grads = None
+        for opt in self._optimizers.values():
+            if opt._pp is self:
+                opt._sync_optimizer_state()
+
+    @torch.no_grad()
     def keep_(self, members) -> PopulationParameters:
-        if not self.is_population:
-            raise ValueError('keep_() requires a populated PopulationParameters')
-
-        keep_idx = list(dict.fromkeys(self.resolve_members(members)))
-        if not keep_idx:
-            raise ValueError('cannot delete all members of a population')
-
+        self._require_pop('keep_()')
+        keep = list(dict.fromkeys(self.resolve_members(members, non_empty = True)))
         old_pop = self.pop_size
-        with torch.no_grad():
-            new_trainable = []
-            for f in self._trainable_flats:
-                p = Parameter(slice_pop(f, keep_idx), requires_grad = True)
-                if exists(f.grad):
-                    p.grad = slice_pop(f.grad, keep_idx)
-                new_trainable.append(p)
-            self._trainable_flats = ParameterList(new_trainable)
-
-            for store in (self._frozen_store, self._buffer_store, *self._dynamic_stores()):
-                store.keep_(keep_idx, old_pop)
-
-            for n, lf in list(self.lanes.items()):
-                if lf.ndim >= 1 and lf.shape[0] == old_pop:
-                    self.lanes[n] = slice_pop(lf, keep_idx)
-
-        self.pop_size = len(keep_idx)
-        self.clear_grad_tracking()
-        for att in self._optimizers.values():
-            att._sync_optimizer_state()
+        if exists(self._pop_param):
+            old = self._pop_param
+            sliced = Parameter(slice_pop(old, keep), requires_grad = True)
+            if exists(old.grad):
+                sliced.grad = slice_pop(old.grad, keep)
+            self._pop_param = sliced
+        self.store.keep_(keep, old_pop)
+        self._finish_resize(len(keep))
         return self
 
     def delete_(self, members) -> PopulationParameters:
-        if not self.is_population:
-            raise ValueError('delete_() requires a populated PopulationParameters')
+        self._require_pop('delete_()')
         drop = set(self.resolve_members(members))
-        keep_idx = [i for i in range(self.pop_size) if i not in drop]
-        if not keep_idx:
-            raise ValueError('cannot delete all members of a population')
-        return self.keep_(keep_idx)
+        return self.keep_([i for i in range(self.pop_size) if i not in drop])
 
+    @torch.no_grad()
     def append_(self, source) -> int:
-        if not self.is_population:
-            raise ValueError('append_() requires a populated PopulationParameters')
-
+        self._require_pop('append_()')
         src_p, src_b = self._extract_source(source)
         old_pop = self.pop_size
-
-        def _row_for(specs: list[TensorSpec], bucket: int, flat: Tensor) -> Tensor:
-            bs = [s for s in specs if s.bucket == bucket]
-            for s in bs:
-                if s.name not in src_p:
-                    raise KeyError(f'source is missing parameter {s.name!r}')
-            row, _ = pack([src_p[s.name].detach().to(flat) for s in bs], '*')
-            return rearrange(row, 'd -> 1 d')
-
-        with torch.no_grad():
-            self._trainable_flats = ParameterList([
-                Parameter(pad_pop(f, _row_for(self.pop_trainable_specs, b, f)), requires_grad = True)
-                for b, f in enumerate(self._trainable_flats)
-            ])
-
-            pop_frozen = [s for s in self.frozen_specs if not s.shared]
-            for b in range(max((s.bucket for s in pop_frozen), default = -1) + 1):
-                k = f'pop_{b}'
-                row = _row_for(pop_frozen, b, self._frozen_store[k])
-                self._frozen_store.set(k, pad_pop(self._frozen_store[k], row), populated = True)
-
-            for name, buf in list(self._buffer_store.items()):
-                pad = src_b[name].unsqueeze(0) if (exists(src_b) and name in src_b) else buf[:1]
-                persistent = self._buffer_store._meta[name].persistent
-                self._buffer_store.set(name, pad_pop(buf, pad), populated = True, persistent = persistent)
-
-            for store in self._dynamic_stores():
-                store.append_(old_pop)
-
-            for n, lf in list(self.lanes.items()):
-                if lf.ndim >= 1 and lf.shape[0] == old_pop:
-                    self.lanes[n] = pad_pop(lf)
-
-        self.pop_size = old_pop + 1
-        self.clear_grad_tracking()
-        for att in self._optimizers.values():
-            att._sync_optimizer_state()
+        if exists(self._pop_param):
+            self._pop_param = Parameter(pad_pop(self._pop_param), requires_grad = True)
+        self.store.append_(old_pop)
+        self._finish_resize(old_pop + 1)
+        self._copy_member_state_(old_pop, src_p, src_b, skip_shared = True)
         return old_pop
 
     def extra_repr(self) -> str:
+        n = sum(s.numel for s in self._schema.trainable)
         if not self.is_population:
-            return f'noop, num_params={self.num_params}'
-        mode = 'functional' if self.is_functional else 'backed'
-        return f'pop_size={self.pop_size}, num_params={self.num_params}, mode={mode}'
+            return f'noop, num_params={n}'
+        return f'pop_size={self.pop_size}, num_params={n}, mode={"functional" if self.is_functional else "backed"}'

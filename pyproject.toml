@@ -34,7 +34,9 @@ Homepage = "https://pypi.org/project/torch-population/"
 Repository = "https://github.com/lucidrains/torch-population"
 
 [project.optional-dependencies]
-examples = []
+examples = [
+    "torchvision"
+]
 test = [
     "pytest"
 ]
