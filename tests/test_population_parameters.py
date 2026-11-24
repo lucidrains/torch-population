@@ -303,3 +303,46 @@ def test_generic_opt_store():
     store.reset_members_([0])
     assert store.slot_views('a')['0.weight'][0].norm() == 0
     assert torch.allclose(store.slot_views('b')['2.bias'][1], torch.full((4,), 3.0))
+
+def test_detach_is_backed_and_clone_without_opt():
+    torch.manual_seed(11)
+    pop = Population(mlp(), pop_size = 4)
+    opt = pop.optimizer(torch.optim.Adam, lr = 1e-2)
+    pp = pop.population_parameters
+
+    # clone without optimizer state for lightweight EMA shadow
+    ema_pp = pp.clone(include_opt = False)
+    assert ema_pp.opt_slot_flat('exp_avg') is None
+
+    x = torch.randn(4, 6, 8)
+    cur_pp = opt.functional_step(pop(x, params = pp, per_individual = True).pow(2).mean(), pp, create_graph = True)
+    assert cur_pp.is_functional
+
+    with pytest.raises(ValueError):
+        opt.functional_step(pop(x, params = ema_pp, per_individual = True).pow(2).mean(), ema_pp)
+
+    # detach returns a backed PopulationParameters supporting dtype conversion, state_dict, keep_, append_, mean()
+    detached = cur_pp.detach()
+    assert not detached.is_functional
+    assert detached.flat_params.grad_fn is None
+    assert detached.flat_params.requires_grad
+    assert '_pop_param' in detached.state_dict()
+
+    detached.double()
+    assert detached.flat_params.dtype == torch.float64
+    assert detached.opt_slot_flat('exp_avg').dtype == torch.float64
+
+    detached.keep_([0, 2])
+    assert detached.pop_size == 2
+    assert detached.flat_params.shape[0] == 2
+    assert detached.opt_slot_flat('exp_avg').shape[0] == 2
+
+    avg_mod = detached.mean()
+    assert avg_mod[0].weight.requires_grad
+    assert avg_mod[0].weight.dtype == torch.float64
+
+    # ema copy_from_ + lerp_ works cleanly without opt state
+    mask = torch.tensor([True, False, True, False])
+    ema_pp.copy_from_(pp, members = mask)
+    ema_pp.lerp_(pp, 0.1)
+    assert torch.allclose(ema_pp.flat_params[mask], pp.flat_params[mask])

@@ -369,3 +369,53 @@ def test_tied_frozen_parameterless_state_dict_and_dtype():
     assert out64.dtype == torch.float64
     assert pop64[0].head.weight.dtype == torch.float64
     assert torch.allclose(pop64[0](x.double()), out64[0], atol = 1e-10)
+
+def test_per_individual_default_requires_grad_and_selectors():
+    torch.manual_seed(0)
+    lin = nn.Linear(8, 4)
+    lin.bias.requires_grad_(False)
+    pop = Population(lin, pop_size = 4, per_individual = True)
+
+    x_pop = torch.randn(4, 5, 8)
+    out = pop(x_pop)
+    assert out.shape == (4, 5, 4)
+    assert torch.allclose(out[2], pop[2](x_pop[2]), atol = 1e-6)
+
+    # override per_individual=False on a single call and preserve default across slicing
+    x_shared = torch.randn(5, 8)
+    assert pop(x_shared, per_individual = False).shape == (4, 5, 4)
+    sub = pop[[True, False, True, False]]
+    assert sub.pop_size == 2
+    assert sub.per_individual
+    assert sub(torch.randn(2, 5, 8)).shape == (2, 5, 4)
+
+    with pytest.raises(TypeError):
+        _ = pop[True]
+    with pytest.raises(ValueError):
+        _ = pop[torch.tensor(True)]
+    with pytest.raises(TypeError):
+        _ = pop.population_parameters[torch.tensor(True)]
+
+    # self-permuting slice assignment & view source replace
+    w_before = pop.params_dict['weight'].detach().clone()
+    pop[[1, 0, 3, 2]] = pop
+    assert torch.equal(pop.params_dict['weight'][0], w_before[1])
+    assert torch.equal(pop.params_dict['weight'][1], w_before[0])
+    pop.replace(2, pop.view(0))
+    assert torch.equal(pop.params_dict['weight'][2], pop.params_dict['weight'][0])
+
+    # requires_grad preserved under no_grad() and in mean()
+    with torch.no_grad():
+        ind = pop[1]
+    assert ind.weight.requires_grad
+    assert not ind.bias.requires_grad
+
+    avg = pop.mean()
+    assert avg.weight.requires_grad
+    assert not avg.bias.requires_grad
+
+    # pattern matching is exact / module-prefix / glob (not naive substring)
+    deep = nn.Sequential(*[nn.Linear(4, 4) for _ in range(11)])
+    pop_deep = Population(deep, pop_size = 2, shared = ('0.bias',))
+    assert pop_deep.population_parameters.is_shared_param('0.bias')
+    assert not pop_deep.population_parameters.is_shared_param('10.bias')

@@ -53,9 +53,10 @@ pop(x).pow(2).mean().backward()
 opt.step()
 
 # toggle state sharing across the population at runtime
+# share() reduces the P separate states along the pop dim (default 'mean'; also 'max', 'min', 'sum', 'first', 'zero', member index, callable, or per-key dict)
 
-opt.share()
-opt.unshare()
+opt.share(reduce = 'mean')                                 # or opt.share(reduce = {'square_avg': 'max', 'step': 'max'})
+opt.unshare()                                              # broadcasts shared state back to P independent slots
 
 # extract one individual + its native torch.optim.Optimizer, train solo, write both back in
 
@@ -100,13 +101,13 @@ pop.append(0)                                             # P: 3 -> 4
 avg_net = pop.mean()                                      # standalone nn.Module with averaged weights
 ```
 
-### Differentiable meta-learning (`functional_step`)
+### Differentiable meta-learning & multi-loss gradient control (`autograd`, `functional_step`)
 
 ```python
 pop = Population(net, pop_size = 4)
 opt = pop.optimizer(torch.optim.RMSprop, lr = 1e-3, shared = False)
 pp = pop.population_parameters
-ema_pp = pp.clone()
+ema_pp = pp.clone(include_opt = False)
 
 cur_pp = pp
 for _ in range(2):
@@ -118,6 +119,12 @@ meta_loss.backward()                                      # gradients flow throu
 
 pp.copy_from_(cur_pp.detach())
 ema_pp.lerp_(pp, 0.05)
+
+# multi-loss / PCGrad / custom gradient lanes (works with both step() and functional_step())
+
+g_task = pp.autograd(loss_task, retain_graph = True)      # {name: (P, ...)} scoped via names=
+g_aux  = pp.autograd(loss_aux)
+opt.step(grads = {k: g_task[k] + 0.5 * g_aux[k] for k in g_task})
 ```
 
 ### Example: train 10 MNIST networks in parallel
