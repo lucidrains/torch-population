@@ -4,11 +4,12 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
+from math import prod
 from numbers import Integral
 from typing import TYPE_CHECKING
 
 import torch
-from einops import pack, unpack
+from einops import pack
 from torch import Tensor, is_tensor
 from torch.nn import Module, Parameter
 
@@ -35,6 +36,18 @@ def is_int_index(k) -> bool:
 
 def has_pop_dim(t: Tensor, pop_size: int | None) -> bool:
     return exists(pop_size) and t.ndim >= 1 and t.shape[0] == pop_size
+
+def is_py_scalar(v) -> bool:
+    return isinstance(v, (bool, int, float))
+
+def is_state_val(v) -> bool:
+    return is_tensor(v) or is_py_scalar(v)
+
+def to_state_tensor(v) -> Tensor:
+    if is_tensor(v):
+        return v
+    dtype = torch.bool if isinstance(v, bool) else (torch.int64 if isinstance(v, int) else torch.float64)
+    return torch.tensor(v, dtype = dtype)
 
 def normalize_index(index, size: int) -> int:
     if not is_int_index(index):
@@ -112,10 +125,10 @@ def clone_template(
     }
 
     for sub in cloned.modules():
-        for name, p in list(sub._parameters.items()):
+        for name, p in sub._parameters.items():
             if exists(p):
                 sub._parameters[name] = param_map[id(p)]
-        for name, b in list(sub._buffers.items()):
+        for name, b in sub._buffers.items():
             if exists(b):
                 sub._buffers[name] = buffer_map[id(b)]
 
@@ -124,47 +137,54 @@ def clone_template(
     return cloned
 
 def slice_pop(t: Tensor, indices: list[int]) -> Tensor:
-    return t.detach().index_select(0, torch.tensor(indices, dtype = torch.long, device = t.device))
+    return t.detach()[indices]
 
 def pad_pop(t: Tensor, row: Tensor | None = None) -> Tensor:
     pad = row.detach().to(t) if exists(row) else torch.zeros((1, *t.shape[1:]), device = t.device, dtype = t.dtype)
     return torch.cat((t.detach(), pad), dim = 0)
 
-def unpack_tensors(flat: Tensor, shapes: list[tuple[int, ...]], idx: int | None = None) -> list[Tensor]:
+def scatter_pop(base: Tensor, indices: list[int], vals: Sequence[Tensor]) -> Tensor:
+    if len(indices) == base.shape[0] and indices == list(range(base.shape[0])):
+        return torch.stack(list(vals))
+    by_idx = {i: v.to(base.device) for i, v in zip(indices, vals)}
+    return torch.stack([by_idx[i] if i in by_idx else base[i] for i in range(base.shape[0])])
+
+def unpack_tensors(flat: Tensor, shapes: list[tuple[int, ...]], sizes: list[int] | None = None) -> list[Tensor]:
     if not shapes:
         return []
-    if flat.ndim == 2 and exists(idx):
-        return unpack(flat[idx], shapes, '*')
-    return unpack(flat, shapes, 'p *' if flat.ndim == 2 else '*')
+    lead = flat.shape[:-1]
+    split_sizes = sizes if exists(sizes) else [prod(s) for s in shapes]
+    return [t.view(*lead, *shape) for t, shape in zip(flat.split(split_sizes, dim = -1), shapes)]
 
 def slice_spec(spec: TensorSpec, flat: Tensor) -> Tensor:
     return flat[..., spec.offset : spec.offset + spec.numel].view(*flat.shape[:-1], *spec.shape)
+
+def _reduce_mean(t: Tensor) -> Tensor:
+    if t.is_floating_point():
+        return t.mean(dim = 0)
+    if t.dtype == torch.bool:
+        return t.any(dim = 0)
+    return t.float().mean(dim = 0).round().to(t.dtype)
+
+_REDUCTIONS: dict[str, Callable[[Tensor], Tensor]] = {
+    'first': lambda t: t[0],
+    'last': lambda t: t[-1],
+    'zero': lambda t: torch.zeros_like(t[0]),
+    'mean': _reduce_mean,
+    'median': lambda t: t.median(dim = 0).values,
+    'sum': lambda t: t.sum(dim = 0).to(t.dtype),
+    'max': lambda t: t.amax(dim = 0),
+    'min': lambda t: t.amin(dim = 0),
+    'prod': lambda t: t.prod(dim = 0).to(t.dtype),
+}
 
 def reduce_pop(t: Tensor, reduction = 'mean') -> Tensor:
     if callable(reduction):
         return reduction(t)
     if is_int_index(reduction):
         return t[normalize_index(reduction, t.shape[0])]
-    if reduction == 'first':
-        return t[0]
-    if reduction == 'last':
-        return t[-1]
-    if reduction == 'zero':
-        return torch.zeros_like(t[0])
-    if reduction == 'mean':
-        if t.is_floating_point():
-            return t.mean(dim = 0)
-        if t.dtype == torch.bool:
-            return t.any(dim = 0)
-        return t.float().mean(dim = 0).round().to(t.dtype)
-    if reduction == 'sum':
-        return t.sum(dim = 0).to(t.dtype)
-    if reduction == 'max':
-        return t.amax(dim = 0)
-    if reduction == 'min':
-        return t.amin(dim = 0)
-    if reduction == 'prod':
-        return t.prod(dim = 0).to(t.dtype)
+    if reduction in _REDUCTIONS:
+        return _REDUCTIONS[reduction](t)
     raise ValueError(f'unsupported reduction {reduction!r}')
 
 def encode_buffer_key(key: str) -> str:
@@ -192,15 +212,13 @@ class ParamSlot:
 @dataclass
 class SlotSpec:
     shared: bool
-    pop_names: list[str]
-    pop_shapes: list[tuple[int, ...]]
-    shared_names: list[str]
-    shared_shapes: list[tuple[int, ...]]
+    groups: dict[str, list[TensorSpec]]
 
 @dataclass
 class AuxMeta:
     shared: bool
     cpu_scalar: bool = False
+    py_type: type | None = None
 
 # colocated buffer bank
 
@@ -244,11 +262,11 @@ class TensorStore(Module):
     def as_dict(self, prefix: str = '') -> dict[str, Tensor]:
         return dict(self.items(prefix))
 
-    def is_populated(self, key: str, pop_size: int | None) -> bool:
-        if not exists(pop_size) or key not in self._populated:
+    def is_populated(self, key: str, pop_size: int | None = None) -> bool:
+        if key not in self._populated:
             return False
         flag = self._populated[key]
-        return flag if exists(flag) else has_pop_dim(self._buffers[encode_buffer_key(key)], pop_size)
+        return flag if exists(flag) else has_pop_dim(self[key], pop_size)
 
     @torch.no_grad()
     def upsert_(
@@ -275,7 +293,7 @@ class TensorStore(Module):
             return self.set(key, buf, populated = True, persistent = persistent)
 
         src = t.to(cur)
-        if exists(idx) and has_pop_dim(cur, pop_size):
+        if exists(idx) and self.is_populated(key, pop_size):
             src = src[idx] if has_pop else src
             cur[idx] = cur[idx].lerp(src, 1. - decay) if exists(decay) else src
             return cur
@@ -340,16 +358,16 @@ class TensorStore(Module):
                 dst[indices] = src[indices].detach().to(dst)
 
     @torch.no_grad()
-    def keep_(self, indices: list[int], old_pop: int):
+    def keep_(self, indices: list[int], pop_size: int | None = None):
         for key in self._populated:
-            if self.is_populated(key, old_pop):
+            if self.is_populated(key, pop_size):
                 buf_key = encode_buffer_key(key)
                 self._buffers[buf_key] = slice_pop(self._buffers[buf_key], indices)
 
     @torch.no_grad()
-    def append_(self, old_pop: int):
+    def append_(self, pop_size: int | None = None):
         for key in self._populated:
-            if self.is_populated(key, old_pop):
+            if self.is_populated(key, pop_size):
                 buf_key = encode_buffer_key(key)
                 cur = self._buffers[buf_key]
                 self._buffers[buf_key] = pad_pop(cur, cur[:1] if key in self._repeat_on_append else None)
@@ -431,23 +449,19 @@ class OptStore:
         pop_specs = [s for s in selected if not s.shared]
         shared_specs = [s for s in selected if s.shared]
         lead = None if (shared or not pp.is_population) else pp.pop_size
+        groups: dict[str, list[TensorSpec]] = {}
 
-        for specs, key, pop_dim in ((pop_specs, f'slot/{slot}/pop', lead), (shared_specs, f'slot/{slot}/sh', None)):
+        for suffix, specs, pop_dim in (('pop', pop_specs, lead), ('sh', shared_specs, None)):
             if not specs:
                 continue
             first = named[specs[0].name]
             dtype = dtypes.get(specs[0].name, first.dtype) if exists(dtypes) else first.dtype
             numel = sum(s.numel for s in specs)
             shape = (pop_dim, numel) if exists(pop_dim) else (numel,)
-            self.set(key, torch.zeros(shape, device = first.device, dtype = dtype), populated = exists(pop_dim))
+            self.set(f'slot/{slot}/{suffix}', torch.zeros(shape, device = first.device, dtype = dtype), populated = exists(pop_dim))
+            groups[suffix] = specs
 
-        self.slots[slot] = SlotSpec(
-            shared = shared,
-            pop_names = [s.name for s in pop_specs],
-            pop_shapes = [s.shape for s in pop_specs],
-            shared_names = [s.name for s in shared_specs],
-            shared_shapes = [s.shape for s in shared_specs],
-        )
+        self.slots[slot] = SlotSpec(shared = shared, groups = groups)
         return self
 
     def alloc_aux(
@@ -460,6 +474,7 @@ class OptStore:
         device: torch.device,
         shared: bool = False,
         cpu_scalar: bool | None = None,
+        py_type: type | None = None,
     ) -> Tensor:
         buf_key = f'aux/{key}/{param}'
         params = self.aux.setdefault(key, {})
@@ -467,10 +482,10 @@ class OptStore:
             return self[buf_key]
 
         pp = self._pp
-        is_shared = shared or (pp.has_param(param) and pp.is_shared_param(param))
+        is_shared = shared or pp.is_shared_param(param)
         is_pop = pp.is_population and not is_shared
-        is_cpu = default(cpu_scalar, shape == () and device.type == 'cpu')
-        params[param] = AuxMeta(shared = is_shared, cpu_scalar = is_cpu)
+        is_cpu = default(cpu_scalar, exists(py_type) or (shape == () and device.type == 'cpu'))
+        params[param] = AuxMeta(shared = is_shared, cpu_scalar = is_cpu, py_type = py_type)
 
         full_shape = (pp.pop_size, *shape) if is_pop else shape
         return self.set(buf_key, torch.zeros(full_shape, device = device, dtype = dtype), populated = is_pop)
@@ -481,27 +496,25 @@ class OptStore:
     def aux_keys_for(self, param: str) -> list[str]:
         return [key for key, params in self.aux.items() if param in params]
 
-    def slot_views(self, slot: str, *, idx: int | None = None) -> dict[str, Tensor]:
-        spec = self.slots[slot]
+    def slot_views(self, slot: str) -> dict[str, Tensor]:
         views: dict[str, Tensor] = {}
-        for suffix, names, shapes in (('pop', spec.pop_names, spec.pop_shapes), ('sh', spec.shared_names, spec.shared_shapes)):
-            if names:
-                buf = self[f'slot/{slot}/{suffix}']
-                views.update(zip(names, unpack_tensors(buf, shapes, idx = idx if buf.ndim == 2 else None)))
+        for suffix, specs in self.slots[slot].groups.items():
+            buf = self[f'slot/{slot}/{suffix}']
+            views.update(zip((s.name for s in specs), unpack_tensors(buf, [s.shape for s in specs])))
         return views
 
     def all_views(self) -> dict[str, dict[str, Tensor]]:
         return {slot: self.slot_views(slot) for slot in self.slots}
 
     def pack_slots_(self, views: dict[str, dict[str, Tensor]], *, is_pop_group: bool):
-        suffix, attr = ('pop', 'pop_names') if is_pop_group else ('sh', 'shared_names')
+        suffix = 'pop' if is_pop_group else 'sh'
         for key, slot in self.slots.items():
-            names = getattr(slot, attr)
-            if not names:
+            specs = slot.groups.get(suffix)
+            if not specs:
                 continue
             slot_key = f'slot/{key}/{suffix}'
             is_pop = self[slot_key].ndim == 2
-            packed, _ = pack([views[key][n] for n in names], 'p *' if is_pop else '*')
+            packed, _ = pack([views[key][s.name] for s in specs], 'p *' if is_pop else '*')
             self.set(slot_key, packed, populated = is_pop)
 
     def alloc_global(self, name: str, init_tensor: Tensor, *, populated: bool = False) -> Tensor:
@@ -523,21 +536,25 @@ class OptStore:
         flags = self.global_tensor('_init')
         if not exists(flags):
             return True
-        if flags.ndim == 1:
-            return bool(flags[spec.trainable_index])
         col = flags[:, spec.trainable_index]
         return bool(col.any() if (spec.shared or not exists(idx)) else col[idx])
 
     def mark_init_(self, specs: Sequence[TensorSpec], members: list[int] | None = None, value: bool = True):
         flags = self['global/_init']
         cols = [s.trainable_index for s in specs]
-        if flags.ndim == 1:
-            flags[cols] = value
-        elif not exists(members):
+        if not exists(members):
             flags[:, cols] = value
         else:
             for m in members:
                 flags[m, cols] = value
+
+    def _has_shared_member_state(self) -> bool:
+        return any(slot.shared for slot in self.slots.values()) or any(
+            meta.shared
+            for params in self.aux.values()
+            for pname, meta in params.items()
+            if not self._pp.is_shared_param(pname)
+        )
 
     def reset_members_(self, indices: list[int] | None):
         hp_prefix = f'{self._prefix}hp/'
@@ -546,25 +563,17 @@ class OptStore:
             self._prefix,
             pred = lambda k: not k.startswith(hp_prefix) and k != init_key,
             indices = indices,
-            pop_size = self._pp.pop_size,
         )
         flags = self.global_tensor('_init')
         if not exists(flags):
             return
         if not exists(indices):
             flags.zero_()
-            return
-        has_shared_state = any(slot.shared for slot in self.slots.values()) or any(
-            meta.shared
-            for params in self.aux.values()
-            for pname, meta in params.items()
-            if not self._pp.is_shared_param(pname)
-        )
-        if not has_shared_state:
+        elif not self._has_shared_member_state():
             self.mark_init_([s for s in self._pp.trainable_specs if not s.shared], indices, value = False)
 
     def clone_handle(self, new_pp: PopulationParameters) -> OptStore:
         out = OptStore(new_pp, self.name)
-        out.slots = deepcopy(self.slots)
-        out.aux = deepcopy(self.aux)
+        out.slots = {k: SlotSpec(s.shared, dict(s.groups)) for k, s in self.slots.items()}
+        out.aux = {k: {p: AuxMeta(m.shared, m.cpu_scalar, m.py_type) for p, m in ps.items()} for k, ps in self.aux.items()}
         return out

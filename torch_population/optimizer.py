@@ -6,10 +6,9 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Literal
 
 import torch
-from einops import pack, repeat
+from einops import pack, rearrange, repeat
 from torch import Tensor, is_tensor
-from torch.autograd import grad as torch_grad
-from torch.nn import Module, Parameter
+from torch.nn import Module
 from torch.optim import Optimizer
 from torch.overrides import TorchFunctionMode
 
@@ -20,9 +19,14 @@ from torch_population.store import (
     TensorSpec,
     default,
     exists,
+    is_py_scalar,
     is_sequence,
+    is_state_val,
     reduce_pop,
+    scatter_pop,
     slice_spec,
+    to_state_tensor,
+    unpack_tensors,
 )
 
 if TYPE_CHECKING:
@@ -46,6 +50,13 @@ class _SafeSqrt(torch.autograd.Function):
         denom = torch.where(positive, 2. * out, torch.ones_like(out))
         return torch.where(positive, grad_out / denom, torch.zeros_like(grad_out))
 
+_ADDCMUL = (Tensor.addcmul_, torch.addcmul, Tensor.addcmul)
+_SQUARE = (torch.square, Tensor.square)
+_MUL = (torch.mul, Tensor.mul)
+_POW = (torch.pow, Tensor.pow)
+_SQRT = (torch.sqrt, Tensor.sqrt)
+_DETACH = (torch.detach, Tensor.detach)
+
 class _DifferentiableStepMode(TorchFunctionMode):
     def __init__(self, detach_preconditioner: bool = True):
         self.detach_preconditioner = detach_preconditioner
@@ -53,16 +64,19 @@ class _DifferentiableStepMode(TorchFunctionMode):
     def __torch_function__(self, func, types, args = (), kwargs = None):
         kwargs = kwargs or {}
         if self.detach_preconditioner:
-            if func in (Tensor.addcmul_, torch.addcmul, Tensor.addcmul) and len(args) >= 3 and args[1] is args[2]:
+            if func in _ADDCMUL and len(args) >= 3 and args[1] is args[2]:
                 return func(args[0], args[1].detach(), args[2].detach(), *args[3:], **kwargs)
-            if func in (torch.square, Tensor.square):
+            if func in _SQUARE:
                 return func(args[0].detach(), **kwargs)
-            if func in (torch.mul, Tensor.mul) and len(args) == 2 and args[0] is args[1]:
+            if func in _MUL and len(args) == 2 and args[0] is args[1]:
                 return func(args[0].detach(), args[1].detach(), **kwargs)
-            if func in (torch.pow, Tensor.pow) and len(args) == 2 and is_tensor(args[0]) and args[1] == 2:
+            if func in _POW and len(args) == 2 and is_tensor(args[0]) and args[1] == 2:
                 return func(args[0].detach(), args[1], **kwargs)
+        # preserve gradient graph when PyTorch's SGD(momentum>0) calls grad.detach().clone() on first step
+        if func in _DETACH and not kwargs and args and is_tensor(args[0]) and args[0].requires_grad:
+            return args[0]
         if not kwargs and args and is_tensor(args[0]) and args[0].requires_grad:
-            if func in (torch.sqrt, Tensor.sqrt):
+            if func in _SQRT:
                 return _SafeSqrt.apply(args[0])
             if func is Tensor.sqrt_:
                 return args[0].copy_(_SafeSqrt.apply(args[0].clone()))
@@ -198,9 +212,8 @@ def _step_probe_pair(opt_cls, opt_args: tuple, opt_kwargs: dict, ref: Tensor, *,
                 p.grad = g
                 o.step()
 
-        if not hetero:
-            if not all(not is_tensor(v) or v.shape in (flat.shape, ()) for v in batch_opt.state.get(flat, {}).values()):
-                return False
+        if not hetero and not all((not is_state_val(v)) or is_py_scalar(v) or v.shape in (flat.shape, ()) for v in batch_opt.state.get(flat, {}).values()):
+            return False
 
         return torch.allclose(flat.view(2, 3, 2), torch.stack((r0, r1)), atol = 1e-5, rtol = 1e-4)
     except Exception:
@@ -219,7 +232,7 @@ def probe_optimizer(opt_cls, opt_args: tuple, opt_kwargs: dict, specs: list[Tens
         probe.step()
 
         defaults = {k: v for k, v in probe.param_groups[0].items() if k != 'params'}
-        state = {s.name: {k: v for k, v in probe.state.get(d, {}).items() if is_tensor(v)} for s, d in zip(specs, dummies)}
+        state = {s.name: {k: v for k, v in probe.state.get(d, {}).items() if is_state_val(v)} for s, d in zip(specs, dummies)}
 
         ref = named[specs[0].name]
         can_batch = _step_probe_pair(opt_cls, opt_args, opt_kwargs, ref) if test_batch else False
@@ -228,8 +241,7 @@ def probe_optimizer(opt_cls, opt_args: tuple, opt_kwargs: dict, specs: list[Tens
     return defaults, state, can_batch, can_batch_hetero
 
 def analyze_batched_state(store: OptStore, specs: list[TensorSpec], *, allow_hetero: bool) -> tuple[Literal['uniform', 'hetero'], bool] | None:
-    names = [s.name for s in specs]
-    if any(slot.pop_names != names for slot in store.slots.values()):
+    if any(slot.groups.get('pop') != specs for slot in store.slots.values()):
         return None
 
     flags = store['global/_init'][:, [s.trainable_index for s in specs]]
@@ -239,9 +251,9 @@ def analyze_batched_state(store: OptStore, specs: list[TensorSpec], *, allow_het
     if not flags.any():
         return 'uniform', False
 
-    first = names[0]
+    first, *rest = (s.name for s in specs)
     aux_keys = store.aux_keys_for(first)
-    if any(store.aux_keys_for(s.name) != aux_keys for s in specs[1:]):
+    if any(store.aux_keys_for(name) != aux_keys for name in rest):
         return None
 
     all_aux_uniform = True
@@ -250,16 +262,14 @@ def analyze_batched_state(store: OptStore, specs: list[TensorSpec], *, allow_het
         ref = store[f'aux/{aux_key}/{first}']
         if ref.ndim != (0 if meta.shared else 1):
             return None
-        if any((t := store[f'aux/{aux_key}/{s.name}']).shape != ref.shape or not (t == ref).all() for s in specs[1:]):
+        if any((t := store[f'aux/{aux_key}/{name}']).shape != ref.shape or not (t == ref).all() for name in rest):
             return None
         if not meta.shared and not (ref == ref[0]).all():
             all_aux_uniform = False
 
     if row_init.all() and all_aux_uniform:
         return 'uniform', True
-    if not allow_hetero:
-        return None
-    if not row_init.all() and (any(slot.shared for slot in store.slots.values()) or any(store.aux[k][first].shared for k in aux_keys)):
+    if not allow_hetero or (not row_init.all() and store._has_shared_member_state()):
         return None
     return 'hetero', True
 
@@ -293,6 +303,7 @@ class PopulationOptimizer(Optimizer):
         self.name = default(name, getattr(opt_cls, '__name__', 'opt').lower())
         self._share_all, self._shared_keys = parse_shared_keys(shared)
         self._shared_reduce = shared_reduce
+        self._noop_cache: dict | None = None
 
         sig_params, self._accepted_kwargs = inspect_optimizer_signature(opt_cls)
         store = pp.register_opt_store(self.name)
@@ -334,49 +345,60 @@ class PopulationOptimizer(Optimizer):
     def _is_key_shared(self, key: str) -> bool:
         return self._share_all or key in self._shared_keys
 
-    def _alloc_from_probe(self, store: OptStore, probe_state: dict, cpu_keys: set[tuple[str, str]] | None = None):
+    def _alloc_from_probe(
+        self,
+        store: OptStore,
+        probe_state: dict,
+        cpu_keys: set[tuple[str, str]] | None = None,
+        py_types: dict[tuple[str, str], type] | None = None,
+    ):
         pp = self._pp
         trainable = pp._schema.trainable
         named = pp.named_parameters_dict()
         device = named[trainable[0].name].device
-        init_shape = (pp.pop_size, len(trainable)) if pp.is_population else (len(trainable),)
-        store.alloc_global('_init', torch.zeros(init_shape, device = device, dtype = torch.bool), populated = pp.is_population)
+        store.alloc_global('_init', torch.zeros((len(pp), len(trainable)), device = device, dtype = torch.bool), populated = pp.is_population)
 
         slots: dict[str, dict[str, torch.dtype]] = {}
         for spec in trainable:
             for key, val in probe_state.get(spec.name, {}).items():
-                if tuple(val.shape) == spec.shape:
+                py_type = py_types.get((key, spec.name)) if exists(py_types) else (type(val) if is_py_scalar(val) else None)
+                if not exists(py_type) and is_tensor(val) and tuple(val.shape) == spec.shape:
                     slots.setdefault(key, {})[spec.name] = val.dtype
                     continue
-                is_cpu = (key, spec.name) in cpu_keys if exists(cpu_keys) else (val.ndim == 0 and val.device.type == 'cpu')
+                val_t = to_state_tensor(val)
+                is_cpu = exists(py_type) or ((key, spec.name) in cpu_keys if exists(cpu_keys) else (val_t.ndim == 0 and val_t.device.type == 'cpu'))
                 store.alloc_aux(
-                    key, spec.name, tuple(val.shape),
-                    dtype = val.dtype,
+                    key, spec.name, tuple(val_t.shape),
+                    dtype = val_t.dtype,
                     device = torch.device('cpu') if is_cpu else named[spec.name].device,
                     shared = self._is_key_shared(key),
                     cpu_scalar = is_cpu,
+                    py_type = py_type,
                 )
 
         for key, dtypes in slots.items():
             store.alloc_slot(key, list(dtypes), shared = self._is_key_shared(key), dtypes = dtypes)
 
-    def _write_state_(self, store: OptStore, spec: TensorSpec, key: str, value: Tensor, idx: int | None, views: dict):
+    def _write_state_(self, store: OptStore, spec: TensorSpec, key: str, value, idx: int | None, views: dict):
         is_shared = self._is_key_shared(key)
-        if tuple(value.shape) == spec.shape:
+        py_type = type(value) if is_py_scalar(value) else None
+        val_t = to_state_tensor(value)
+
+        if not exists(py_type) and tuple(val_t.shape) == spec.shape:
             if key not in store.slots:
                 store.alloc_slot(key, shared = is_shared)
                 views[key] = store.slot_views(key)
             buf = views[key].get(spec.name)
         else:
             if spec.name not in store.aux.get(key, ()):
-                store.alloc_aux(key, spec.name, tuple(value.shape), dtype = value.dtype, device = value.device, shared = is_shared)
+                store.alloc_aux(key, spec.name, tuple(val_t.shape), dtype = val_t.dtype, device = val_t.device, shared = is_shared, py_type = py_type)
             buf = store.get(f'aux/{key}/{spec.name}')
 
         if not exists(buf):
             return
-        dst = buf[idx] if (exists(idx) and buf.ndim == value.ndim + 1) else buf
-        if value is not dst:
-            dst.copy_(value.detach().to(dst))
+        dst = buf[idx] if (exists(idx) and buf.ndim == val_t.ndim + 1) else buf
+        if val_t is not dst:
+            dst.copy_(val_t.detach().to(dst))
 
     # hyperparams & Optimizer sync
 
@@ -388,9 +410,9 @@ class PopulationOptimizer(Optimizer):
                 with torch.no_grad():
                     buf.copy_(val.detach().to(buf))
 
-    def _resolve_kwargs(self, *, index = None, collapse: bool = False) -> dict:
+    def _resolve_kwargs(self, *, index = None, collapse: bool = False, store: OptStore | None = None) -> dict:
         self._sync_hp_from_groups()
-        store = self._store
+        store = default(store, self._store)
         out = {}
         for key, val in self.param_groups[0].items():
             if key == 'params':
@@ -423,6 +445,35 @@ class PopulationOptimizer(Optimizer):
             if key in group:
                 group[key] = buf
 
+    def _sync_noop_device(self):
+        pp = self._pp
+        if pp.is_population:
+            return
+        ref = pp.named_parameters_dict()[pp._schema.trainable[0].name]
+        store = self._store
+        for key in store.slots:
+            buf_key = f'slot/{key}/pop'
+            buf = store.get(buf_key)
+            if not exists(buf):
+                continue
+            target_dtype = ref.dtype if (buf.is_floating_point() and ref.is_floating_point()) else buf.dtype
+            if buf.device != ref.device or buf.dtype != target_dtype:
+                store.set(buf_key, buf.to(device = ref.device, dtype = target_dtype), populated = False)
+        for aux_key, params in store.aux.items():
+            for pname, meta in params.items():
+                if meta.cpu_scalar:
+                    continue
+                buf_key = f'aux/{aux_key}/{pname}'
+                buf = store.get(buf_key)
+                if not exists(buf):
+                    continue
+                target_dtype = ref.dtype if (buf.is_floating_point() and ref.is_floating_point()) else buf.dtype
+                if buf.device != ref.device or buf.dtype != target_dtype:
+                    store.set(buf_key, buf.to(device = ref.device, dtype = target_dtype), populated = False)
+        flags = store.global_tensor('_init')
+        if exists(flags) and flags.device != ref.device:
+            store.set('global/_init', flags.to(device = ref.device), populated = False)
+
     # state views, extract & writeback
 
     @staticmethod
@@ -436,9 +487,10 @@ class PopulationOptimizer(Optimizer):
         detach: bool = False,
         clone_shared: bool = False,
         to_cpu: bool = False,
-    ) -> dict[str, Tensor]:
+        unwrap_py: bool = False,
+    ) -> dict[str, Tensor | int | float | bool]:
         slice_member = store._pp.is_population and exists(idx)
-        state: dict[str, Tensor] = {}
+        state: dict[str, Tensor | int | float | bool] = {}
 
         for key, slot_views in views.items():
             if spec.name not in slot_views:
@@ -458,13 +510,17 @@ class PopulationOptimizer(Optimizer):
             if not exists(buf):
                 continue
             val = buf[idx] if (slice_member and not meta.shared) else buf
+            if unwrap_py and exists(meta.py_type):
+                state[aux_key] = meta.py_type(val.item())
+                continue
             if clone or to_cpu:
                 val = val.detach().clone() if detach else val.clone()
             state[aux_key] = val.cpu() if (to_cpu and meta.cpu_scalar) else val
 
         return state
 
-    def named_state(self, pp: PopulationParameters, *, idx: int | None = None, clone: bool = False) -> dict[str, dict[str, Tensor]]:
+    def named_state(self, pp: PopulationParameters | None = None, *, idx: int | None = None, clone: bool = False) -> dict[str, dict[str, Tensor]]:
+        pp = default(pp, self._pp)
         store = pp.opt_stores[self.name]
         views = store.all_views()
         return {s.name: self._param_state(store, s, idx, views, clone = clone, detach = True) for s in pp._schema.trainable}
@@ -473,13 +529,14 @@ class PopulationOptimizer(Optimizer):
         store = pp.opt_stores[self.name]
         named_opt = self.named_state(pp, idx = idx, clone = clone)
         trainable = pp._schema.trainable
-        group = self._resolve_kwargs(index = idx)
+        group = self._resolve_kwargs(index = idx, store = store)
         group['params'] = list(range(len(trainable)))
         state = {i: ({} if (exists(idx) and not store.is_init(s, idx)) else named_opt[s.name]) for i, s in enumerate(trainable)}
         return {'state': state, 'param_groups': [group]}
 
     @torch.no_grad()
     def load_individual_state_dict_(self, pp: PopulationParameters, idx: int, data: Mapping):
+        self._noop_cache = None
         store = pp.opt_stores[self.name]
         named_src, opt_sd = data.get('named_optimizer_state'), data.get('optimizer_state')
         idx_src = opt_sd.get('state', {}) if exists(opt_sd) else {}
@@ -491,7 +548,7 @@ class PopulationOptimizer(Optimizer):
             has_state = bool(entry)
             if has_state:
                 for key, val in entry.items():
-                    if is_tensor(val):
+                    if is_state_val(val):
                         self._write_state_(store, spec, key, val, opt_idx, views)
             elif pp.is_population and not spec.shared:
                 for key, tensor in self._param_state(store, spec, opt_idx, views).items():
@@ -524,7 +581,7 @@ class PopulationOptimizer(Optimizer):
         for spec in pp._schema.trainable:
             if not store.is_init(spec, opt_idx):
                 continue
-            state = self._param_state(store, spec, opt_idx, views, clone = True, to_cpu = True)
+            state = self._param_state(store, spec, opt_idx, views, clone = True, detach = True, to_cpu = True, unwrap_py = True)
             if state:
                 ind_opt.state[ind_named[spec.name]] = state
         return ind, ind_opt
@@ -561,7 +618,7 @@ class PopulationOptimizer(Optimizer):
             for key, slot in store.slots.items():
                 if key in affected and slot.shared != to_shared:
                     slot.shared = to_shared
-                    if slot.pop_names:
+                    if 'pop' in slot.groups:
                         store.set(f'slot/{key}/pop', resize(key, store[f'slot/{key}/pop']), populated = not to_shared)
 
             for aux_key, params in store.aux.items():
@@ -574,7 +631,7 @@ class PopulationOptimizer(Optimizer):
                         store.set(buf_key, resize(aux_key, store[buf_key]), populated = not to_shared)
 
             flags = store.global_tensor('_init')
-            if to_shared and exists(flags) and flags.ndim == 2:
+            if to_shared and exists(flags):
                 flags.copy_(flags.any(dim = 0, keepdim = True).expand_as(flags))
 
         if share_all:
@@ -584,7 +641,6 @@ class PopulationOptimizer(Optimizer):
             self._shared_keys = (current | target) if to_shared else (current - target)
             self._share_all &= to_shared
 
-        self._sync_optimizer_state()
         return self
 
     def share(self, keys: bool | str | Iterable[str] = True, *, reduce = None):
@@ -593,18 +649,36 @@ class PopulationOptimizer(Optimizer):
     def unshare(self, keys: bool | str | Iterable[str] = True):
         return self._convert_sharing(keys, to_shared = False)
 
-    def _member_indices(self, members) -> list[int] | None:
+    def _member_indices(self, members, pp: PopulationParameters | None = None) -> list[int] | None:
         if not exists(members):
             return None
-        indices = list(dict.fromkeys(self._pp.resolve_members(members, non_empty = True)))
-        return indices if self._pp.is_population else None
+        pp = default(pp, self._pp)
+        indices = list(dict.fromkeys(pp.resolve_members(members, non_empty = True)))
+        return indices if pp.is_population else None
 
     def reset(self, members = None):
+        self._noop_cache = None
         self._store.reset_members_(self._member_indices(members))
         return self
 
     def zero_grad(self, set_to_none: bool = True, *, members = None):
         self._pp.zero_grad_(members = members, set_to_none = set_to_none)
+
+    def autograd(self, *losses: Tensor, params: PopulationParameters | None = None, **kwargs):
+        return default(params, self._pp).autograd(*losses, **kwargs)
+
+    def reconcile(self, *losses: Tensor, fn: Callable, params: PopulationParameters | None = None, **kwargs) -> Tensor:
+        return default(params, self._pp).reconcile(*losses, fn = fn, **kwargs)
+
+    @property
+    def flat_params(self) -> Tensor:
+        return self._pp.flat_params
+
+    def ema_(self, name: str, value: Tensor, decay: float | Tensor = 0.99, *, members = None) -> Tensor:
+        return self._pp.ema_(name, value, decay = decay, members = members)
+
+    def tracked(self, name: str) -> Tensor | None:
+        return self._pp.tracked(name)
 
     # stepping (batched fast path + per-member general path)
 
@@ -630,10 +704,12 @@ class PopulationOptimizer(Optimizer):
     ) -> Tensor | None:
         if not (self._can_batch and pp.is_population and exists(flat_param)):
             return None
-        if exists(active_indices) or isinstance(grads, Mapping) or store.items('hp/'):
+        if exists(active_indices) or store.items('hp/'):
             return None
 
         specs = pp._schema.pop_trainable
+        if isinstance(grads, Mapping) and not all(exists(grads.get(s.name)) for s in specs):
+            return None
         if not exists(grads) and exists(pp._active_grads) and any(s.name not in pp._active_grads for s in specs):
             return None
 
@@ -642,7 +718,10 @@ class PopulationOptimizer(Optimizer):
             return None
 
         mode, is_init = analysis
-        flat_grad = grads if exists(grads) else flat_param.grad
+        if isinstance(grads, Mapping):
+            flat_grad, _ = pack([match_grad(s, grads[s.name], None, pp.pop_size) for s in specs], 'p *')
+        else:
+            flat_grad = grads if exists(grads) else flat_param.grad
         if not exists(flat_grad):
             return flat_param
 
@@ -654,43 +733,38 @@ class PopulationOptimizer(Optimizer):
         if is_init:
             for key in store.slots:
                 buf = store[f'slot/{key}/pop']
-                state[key] = (
-                    repeat(buf, 'd -> p d', p = pp.pop_size).clone()
-                    if buf.ndim == 1
-                    else (buf if inplace else buf.clone())
-                )
+                state[key] = repeat(buf, 'd -> p d', p = pp.pop_size).clone() if buf.ndim == 1 else (buf if inplace else buf.clone())
 
             for aux_key in store.aux_keys_for(first):
                 meta = store.aux[aux_key][first]
                 buf = store[f'aux/{aux_key}/{first}']
                 if mode == 'hetero':
-                    val = buf.clone() if meta.shared else buf.unsqueeze(-1).clone()
-                    state[aux_key] = val.to(wp.device)
+                    state[aux_key] = (buf if meta.shared else rearrange(buf, 'p -> p 1')).to(wp.device).clone()
                 else:
-                    val = (buf if meta.shared else buf[0]).clone()
-                    state[aux_key] = val.cpu() if meta.cpu_scalar else val
+                    val = buf if meta.shared else buf[0]
+                    state[aux_key] = meta.py_type(val.item()) if exists(meta.py_type) else (val.cpu() if meta.cpu_scalar else val).clone()
 
-        kwargs = self._filter_kwargs(self._resolve_kwargs(), differentiable = create_graph or mode == 'hetero')
+        kwargs = self._filter_kwargs(self._resolve_kwargs(store = store), differentiable = create_graph or mode == 'hetero')
         next_state = self._run_inner([wp], [wg], [state], kwargs)[0]
 
         for key, val in next_state.items():
-            if not is_tensor(val):
+            if not is_state_val(val):
                 continue
+            val_t = to_state_tensor(val)
             if key in store.slots:
                 slot_key = f'slot/{key}/pop'
                 is_pop = store[slot_key].ndim == 2
-                store.put(slot_key, val if is_pop else self._reduce_shared(key, val), populated = is_pop, inplace = inplace)
+                store.put(slot_key, val_t if is_pop else self._reduce_shared(key, val_t), populated = is_pop, inplace = inplace)
             elif first in store.aux.get(key, ()):
                 is_shared = store.aux[key][first].shared
-                val_out = val.squeeze(-1) if (not is_shared and val.ndim == 2 and val.shape[-1] == 1) else val
+                val_out = rearrange(val_t, 'p 1 -> p') if (not is_shared and val_t.ndim == 2 and val_t.shape[-1] == 1) else val_t
                 for spec in specs:
-                    aux_buf_key = f'aux/{key}/{spec.name}'
-                    val_cast = val_out.to(store[aux_buf_key])
+                    buf_key = f'aux/{key}/{spec.name}'
+                    buf = store[buf_key]
+                    out = val_out.to(buf)
                     if not is_shared:
-                        val_cast = val_cast.expand_as(store[aux_buf_key])
-                    if not inplace:
-                        val_cast = val_cast.clone()
-                    store.put(aux_buf_key, val_cast, populated = not is_shared, inplace = inplace)
+                        out = out.expand_as(buf)
+                    store.put(buf_key, out if inplace else out.clone(), populated = not is_shared, inplace = inplace)
 
         store.mark_init_(specs)
         return wp
@@ -708,28 +782,33 @@ class PopulationOptimizer(Optimizer):
         next_views = None if inplace else {k: dict(v) for k, v in views.items()}
 
         for (spec, _, _), param_states in zip(items, zip(*stepped_states)):
-            state_keys = list(dict.fromkeys(k for st in param_states for k, v in st.items() if is_tensor(v)))
-            for key in state_keys:
-                vals = [st[key] for st in param_states]
+            for key in dict.fromkeys(k for st in param_states for k, v in st.items() if is_state_val(v)):
+                raw_vals = [st[key] for st in param_states]
+                vals = [to_state_tensor(v) for v in raw_vals]
                 is_shared_key = exists(indices) and not spec.shared and self._is_key_shared(key)
+                reduced = self._reduce_shared(key, torch.stack(vals)) if is_shared_key else None
 
                 if inplace:
-                    if is_shared_key:
-                        self._write_state_(store, spec, key, self._reduce_shared(key, torch.stack(vals)), None, views)
+                    if exists(reduced):
+                        self._write_state_(store, spec, key, reduced, None, views)
                     else:
-                        for member, val in zip([None] if not exists(indices) else indices, vals):
+                        for member, val in zip(default(indices, [None]), raw_vals):
                             self._write_state_(store, spec, key, val, member, views)
                     continue
 
-                val = vals[0] if not exists(indices) else (
-                    self._reduce_shared(key, torch.stack(vals)) if is_shared_key else torch.stack(vals)
-                )
+                if exists(reduced):
+                    val = reduced
+                elif exists(indices):
+                    base = views[key][spec.name] if key in store.slots else store[f'aux/{key}/{spec.name}']
+                    val = scatter_pop(base, indices, vals)
+                else:
+                    val = vals[0]
+
                 if key in store.slots:
                     next_views[key][spec.name] = val
                 elif spec.name in store.aux.get(key, ()):
-                    aux_buf_key = f'aux/{key}/{spec.name}'
-                    is_pop_aux = exists(indices) and not spec.shared and not is_shared_key
-                    store.set(aux_buf_key, val.to(store[aux_buf_key].device), populated = is_pop_aux)
+                    buf_key = f'aux/{key}/{spec.name}'
+                    store.set(buf_key, val.to(store[buf_key].device), populated = exists(indices) and not spec.shared and not is_shared_key)
 
         if not inplace:
             store.pack_slots_(next_views, is_pop_group = exists(indices))
@@ -750,14 +829,14 @@ class PopulationOptimizer(Optimizer):
 
         for pos, member in loop:
             kwargs = fixed_kwargs if exists(fixed_kwargs) else self._filter_kwargs(
-                self._resolve_kwargs(index = member), differentiable = create_graph,
+                self._resolve_kwargs(index = member, store = store), differentiable = create_graph,
             )
             step_p = [work_tensor(p if not exists(member) else p[member], inplace, create_graph) for _, p, _ in items]
             step_g = [g if not exists(member) else g[pos] for _, _, g in items]
             if inplace:
                 step_g = [g.detach() for g in step_g]
             step_st = [
-                self._param_state(store, s, member, views, clone = not inplace, clone_shared = exists(indices), to_cpu = True)
+                self._param_state(store, s, member, views, clone = not inplace, clone_shared = exists(indices), to_cpu = True, unwrap_py = True)
                 if store.is_init(s, member) else {}
                 for s, _, _ in items
             ]
@@ -768,6 +847,205 @@ class PopulationOptimizer(Optimizer):
         self._commit_group_states_(store, items, indices, stepped_states, views, inplace = inplace)
         return stepped_params
 
+    def _step_leaf(
+        self,
+        pp: PopulationParameters,
+        store: OptStore,
+        specs: list[TensorSpec],
+        leaf: Tensor | None,
+        flat_grad: Tensor | None,
+        named_grads: Mapping[str, Tensor | None] | None,
+        *,
+        is_pop: bool,
+        inplace: bool,
+        active_indices: list[int] | None = None,
+        create_graph: bool = False,
+    ) -> Tensor | None:
+        if not specs or (pp.is_population and not exists(leaf)):
+            return leaf
+
+        if is_pop:
+            batched = self._try_batched_step(
+                pp, store, leaf, flat_grad if exists(flat_grad) else named_grads,
+                inplace = inplace, active_indices = active_indices, create_graph = create_graph,
+            )
+            if exists(batched):
+                return batched
+
+        if inplace and not exists(flat_grad) and not exists(named_grads):
+            named_grads = pp.named_grads_dict()
+
+        if exists(flat_grad) and pp.is_population:
+            items = [
+                (s, slice_spec(s, leaf), match_grad(s, slice_spec(s, flat_grad), active_indices, pp.pop_size))
+                for s in specs
+            ]
+        elif exists(named_grads):
+            named_p = None if pp.is_population else pp.named_parameters_dict()
+            items = [
+                (
+                    s,
+                    slice_spec(s, leaf) if pp.is_population else named_p[s.name],
+                    match_grad(s, named_grads[s.name], active_indices, pp.pop_size),
+                )
+                for s in specs if exists(named_grads.get(s.name))
+            ]
+        else:
+            return leaf
+
+        if not items:
+            return leaf
+
+        indices = default(active_indices, list(range(pp.pop_size))) if is_pop else None
+        fixed_kwargs = None if is_pop else self._filter_kwargs(
+            self._resolve_kwargs(index = active_indices, collapse = pp.is_population, store = store),
+            differentiable = create_graph,
+        )
+        stepped = self._step_group(
+            store, items, indices,
+            inplace = inplace, create_graph = create_graph, fixed_kwargs = fixed_kwargs,
+        )
+        if inplace:
+            return leaf
+
+        updated = {
+            s.name: (scatter_pop(slice_spec(s, leaf), indices, ts) if is_pop else ts[0])
+            for (s, _, _), ts in zip(items, zip(*stepped))
+        }
+        next_leaf, _ = pack([updated.get(s.name, slice_spec(s, leaf)) for s in specs], 'p *' if is_pop else '*')
+        return next_leaf
+
+    def _step_leaves(
+        self,
+        pp: PopulationParameters,
+        store: OptStore,
+        leaves: tuple[Tensor | None, Tensor | None],
+        leaf_grads: tuple[Tensor | None, Tensor | None],
+        named_grads: Mapping[str, Tensor | None] | None,
+        *,
+        inplace: bool,
+        active_indices: list[int] | None = None,
+        create_graph: bool = False,
+    ) -> tuple[Tensor | None, Tensor | None]:
+        spec_pair = (pp._schema.pop_trainable, pp._schema.shared_trainable)
+        return tuple(
+            self._step_leaf(
+                pp, store, specs, leaf, flat_g, named_grads,
+                is_pop = is_pop, inplace = inplace, active_indices = active_indices, create_graph = create_graph,
+            )
+            for is_pop, specs, leaf, flat_g in zip((True, False), spec_pair, leaves, leaf_grads)
+        )
+
+    def _ensure_noop_inner(self, pp: PopulationParameters, store: OptStore) -> dict:
+        specs = pp._schema.trainable
+        named_p = pp.named_parameters_dict()
+        orig_params = [named_p[s.name] for s in specs]
+        ref = orig_params[0]
+        key = (ref.device, ref.dtype, *(id(p) for p in orig_params))
+
+        cache = self._noop_cache
+        if exists(cache) and cache['key'] == key:
+            return cache
+
+        self._sync_noop_device()
+        step_p = [p.detach() for p in orig_params]
+        kwargs = self._filter_kwargs(self._resolve_kwargs(store = store))
+        inner = self.opt_cls(step_p, *self._opt_args, **kwargs)
+        views = store.all_views()
+
+        bound_t: list[dict[str, Tensor]] = [{} for _ in specs]
+        bound_py: list[dict[str, Tensor]] = [{} for _ in specs]
+        init_done: list[bool] = [store.is_init(s, None) for s in specs]
+
+        for i, (spec, p) in enumerate(zip(specs, step_p)):
+            if not init_done[i]:
+                continue
+            st = self._param_state(store, spec, None, views, clone = False, to_cpu = False, unwrap_py = True)
+            if not st:
+                continue
+            inner.state[p] = st
+            for k, v in st.items():
+                if is_tensor(v):
+                    bound_t[i][k] = v
+                elif spec.name in store.aux.get(k, ()):
+                    bound_py[i][k] = store[f'aux/{k}/{spec.name}']
+
+        self._noop_cache = {
+            'key': key, 'inner': inner, 'step_p': step_p, 'orig': orig_params,
+            'views': views, 'bound_t': bound_t, 'bound_py': bound_py, 'init_done': init_done,
+        }
+        return self._noop_cache
+
+    def _step_noop(self, pp: PopulationParameters, store: OptStore, grads: Mapping[str, Tensor] | Tensor | None):
+        cache = self._ensure_noop_inner(pp, store)
+        inner, step_p, orig_params = cache['inner'], cache['step_p'], cache['orig']
+        schema = pp._schema
+        specs = schema.trainable
+
+        src_g, dst_g = self.param_groups[0], inner.param_groups[0]
+        for k in dst_g:
+            if k != 'params' and k in src_g:
+                dst_g[k] = src_g[k]
+
+        if not exists(grads):
+            active = []
+            for i, (p, orig) in enumerate(zip(step_p, orig_params)):
+                g = orig.grad
+                p.grad = g.detach() if exists(g) else None
+                if exists(p.grad):
+                    active.append(i)
+        elif is_tensor(grads):
+            for p, g in zip(step_p, unpack_tensors(grads.detach(), schema.trainable_shapes, schema.trainable_sizes)):
+                p.grad = g
+            active = list(range(len(specs)))
+        else:
+            active = []
+            for i, (spec, p) in enumerate(zip(specs, step_p)):
+                g = grads.get(spec.name)
+                p.grad = g.detach() if exists(g) else None
+                if exists(p.grad):
+                    active.append(i)
+
+        if not active:
+            return
+
+        inner.step()
+
+        views, bound_t, bound_py, init_done = cache['views'], cache['bound_t'], cache['bound_py'], cache['init_done']
+        newly_init = []
+        for i in active:
+            spec, p = specs[i], step_p[i]
+            p.grad = None
+            if not init_done[i]:
+                init_done[i] = True
+                newly_init.append(spec)
+            st = inner.state.get(p)
+            if not st:
+                continue
+            bt, bp = bound_t[i], bound_py[i]
+            for k, val in list(st.items()):
+                if k in bt:
+                    dst = bt[k]
+                    if val is not dst:
+                        dst.copy_(val.detach().to(dst))
+                        st[k] = dst
+                elif k in bp:
+                    bp[k].fill_(val)
+                elif is_state_val(val):
+                    self._write_state_(store, spec, k, val, None, views)
+                    if k in store.slots and spec.name in views[k]:
+                        bt[k] = st[k] = views[k][spec.name]
+                    elif spec.name in store.aux.get(k, ()):
+                        meta = store.aux[k][spec.name]
+                        dst = store[f'aux/{k}/{spec.name}']
+                        if exists(meta.py_type):
+                            bp[k] = dst
+                        else:
+                            bt[k] = st[k] = dst
+
+        if newly_init:
+            store.mark_init_(newly_init)
+
     def step(self, closure = None, *, grads: Mapping[str, Tensor] | Tensor | None = None, members = None):
         loss = None
         if exists(closure):
@@ -775,35 +1053,19 @@ class PopulationOptimizer(Optimizer):
                 loss = closure()
 
         pp, store = self._pp, self._store
-        schema = pp._schema
+        if not pp.is_population:
+            if exists(members):
+                self._member_indices(members)
+            with torch.no_grad():
+                self._step_noop(pp, store, grads)
+            return loss
+
         active_indices = self._member_indices(members)
+        pop_grad = grads if is_tensor(grads) else None
+        named_grads = ({} if is_tensor(grads) else grads) if exists(grads) else None
 
         with torch.no_grad():
-            pop_done = False
-            if pp.is_population and schema.pop_trainable:
-                pop_done = exists(self._try_batched_step(pp, store, pp._pop_leaf, grads, inplace = True, active_indices = active_indices))
-                if pop_done and not schema.shared_trainable:
-                    return loss
-
-            named_p = pp.named_parameters_dict()
-            named_g = pp.unpack_flat(grads) if is_tensor(grads) else (grads if exists(grads) else pp.named_grads_dict())
-
-            shared_specs = schema.shared_trainable if pp.is_population else schema.trainable
-            groups: list[tuple[list[TensorSpec], list[int] | None]] = [(shared_specs, None)]
-            if pp.is_population and schema.pop_trainable and not pop_done:
-                groups.append((schema.pop_trainable, default(active_indices, list(range(pp.pop_size)))))
-
-            for specs, group_indices in groups:
-                items = [
-                    (s, named_p[s.name], match_grad(s, named_g[s.name], active_indices, pp.pop_size))
-                    for s in specs if exists(named_g.get(s.name))
-                ]
-                if not items:
-                    continue
-                fixed_kwargs = None if exists(group_indices) else self._filter_kwargs(
-                    self._resolve_kwargs(index = active_indices, collapse = pp.is_population)
-                )
-                self._step_group(store, items, group_indices, inplace = True, fixed_kwargs = fixed_kwargs)
+            self._step_leaves(pp, store, pp._leaf_pair, (pop_grad, None), named_grads, inplace = True, active_indices = active_indices)
 
         return loss
 
@@ -813,6 +1075,7 @@ class PopulationOptimizer(Optimizer):
         params: PopulationParameters | None = None,
         *,
         grads: Mapping[str, Tensor] | Tensor | None = None,
+        members = None,
         create_graph: bool = True,
         retain_graph: bool | None = None,
         detach_preconditioner: bool = True,
@@ -821,42 +1084,26 @@ class PopulationOptimizer(Optimizer):
             raise ValueError('pass exactly one of loss or grads to functional_step')
 
         pp = default(params, self._pp)
-        if not pp.is_population:
-            raise ValueError('functional_step requires a populated PopulationParameters')
+        pp._require_pop('functional_step')
         if self.name not in pp.opt_stores:
             raise ValueError(f'params has no optimizer state for {self.name!r} (was it cloned with include_opt=False?)')
 
-        pop_leaf, shared_leaf = pp._pop_leaf, pp._shared_leaf
-        pop_grad: Tensor | None = None
-        shared_grad: Tensor | None = None
-        named_grads: Mapping[str, Tensor] | None = None
+        active_indices = self._member_indices(members, pp = pp)
+        leaf_grads: tuple[Tensor | None, Tensor | None] = (None, None)
+        named_grads = None
 
         if exists(grads):
             if is_tensor(grads):
-                pop_grad = grads
+                leaf_grads = (grads, None)
             elif isinstance(grads, Mapping):
                 named_grads = grads
-                pop_specs = pp._schema.pop_trainable
-                if exists(pop_leaf) and pop_specs and all(exists(grads.get(s.name)) for s in pop_specs):
-                    pop_grad, _ = pack([match_grad(s, grads[s.name], None, pp.pop_size) for s in pop_specs], 'p *')
             else:
                 raise TypeError(f'grads must be Tensor or Mapping, got {type(grads).__name__}')
         else:
-            targets = [t for t in (pop_leaf, shared_leaf) if exists(t)]
-            raw_grads = torch_grad(
-                loss, targets,
-                only_inputs = True,
-                create_graph = create_graph,
-                retain_graph = default(retain_graph, create_graph),
-                allow_unused = True,
-            ) if targets else ()
-            grad_by_id = {id(t): g for t, g in zip(targets, raw_grads)}
-            pop_grad = grad_by_id.get(id(pop_leaf)) if exists(pop_leaf) else None
-            shared_grad = grad_by_id.get(id(shared_leaf)) if exists(shared_leaf) else None
+            leaf_grads = pp._leaf_grads(loss, create_graph = create_graph, retain_graph = retain_graph)
 
         if not create_graph:
-            pop_grad = pop_grad.detach() if exists(pop_grad) else None
-            shared_grad = shared_grad.detach() if exists(shared_grad) else None
+            leaf_grads = tuple(g.detach() if exists(g) else None for g in leaf_grads)
             if exists(named_grads):
                 named_grads = {k: v.detach() for k, v in named_grads.items() if exists(v)}
 
@@ -865,7 +1112,7 @@ class PopulationOptimizer(Optimizer):
             prefixes = ('frozen/', 'buffer/', 'opt/'),
             shallow_prefixes = ('opt/',) if create_graph else (),
         )
-        next_pp = pp._spawn(next_store_bank, None, None, functional = create_graph)
+        next_pp = pp._spawn(next_store_bank, (None, None), functional = create_graph)
         next_store = next_pp.opt_stores[self.name]
         next_store.set('global/_init', next_store['global/_init'].clone(), populated = True)
 
@@ -873,66 +1120,19 @@ class PopulationOptimizer(Optimizer):
         mode_ctx = _DifferentiableStepMode(detach_preconditioner) if create_graph else nullcontext()
 
         with grad_ctx, mode_ctx:
-            next_pop = pop_leaf
-            if exists(pop_leaf) and exists(pop_grad):
-                next_pop = self._try_batched_step(
-                    next_pp, next_store, pop_leaf, pop_grad,
-                    inplace = False, create_graph = create_graph,
-                )
-                if not exists(next_pop):
-                    items = [(s, slice_spec(s, pop_leaf), slice_spec(s, pop_grad)) for s in pp._schema.pop_trainable]
-                    stepped = self._step_group(
-                        next_store, items, list(range(pp.pop_size)),
-                        inplace = False, create_graph = create_graph,
-                    )
-                    next_pop, _ = pack([torch.stack(ts) for ts in zip(*stepped)], 'p *')
-            elif exists(pop_leaf) and exists(named_grads):
-                items = [
-                    (s, slice_spec(s, pop_leaf), match_grad(s, named_grads[s.name], None, pp.pop_size))
-                    for s in pp._schema.pop_trainable if exists(named_grads.get(s.name))
-                ]
-                if items:
-                    stepped = self._step_group(
-                        next_store, items, list(range(pp.pop_size)),
-                        inplace = False, create_graph = create_graph,
-                    )
-                    updated = {s.name: torch.stack(ts) for (s, _, _), ts in zip(items, zip(*stepped))}
-                    next_pop, _ = pack([updated.get(s.name, slice_spec(s, pop_leaf)) for s in pp._schema.pop_trainable], 'p *')
+            next_leaves = self._step_leaves(
+                next_pp, next_store, pp._leaf_pair, leaf_grads, named_grads,
+                inplace = False, active_indices = active_indices, create_graph = create_graph,
+            )
 
-            next_shared = shared_leaf
-            if exists(shared_leaf) and (exists(shared_grad) or exists(named_grads)):
-                if exists(shared_grad):
-                    items = [(s, slice_spec(s, shared_leaf), slice_spec(s, shared_grad)) for s in pp._schema.shared_trainable]
-                else:
-                    items = [
-                        (s, slice_spec(s, shared_leaf), match_grad(s, named_grads[s.name], None, pp.pop_size))
-                        for s in pp._schema.shared_trainable if exists(named_grads.get(s.name))
-                    ]
-                if items:
-                    fixed_kwargs = self._filter_kwargs(self._resolve_kwargs(collapse = True), differentiable = create_graph)
-                    stepped = self._step_group(
-                        next_store, items, None,
-                        inplace = False, create_graph = create_graph, fixed_kwargs = fixed_kwargs,
-                    )
-                    updated = {s.name: t for (s, _, _), t in zip(items, stepped[0])}
-                    next_shared, _ = pack([updated.get(s.name, slice_spec(s, shared_leaf)) for s in pp._schema.shared_trainable], '*')
-
-        if create_graph:
-            next_pp._func_leaves = (next_pop, next_shared)
-        else:
-            def to_param(cur: Tensor | None, orig: Tensor | None) -> Parameter | None:
-                if not exists(cur):
-                    return None
-                return Parameter(cur.detach().clone() if cur is orig else cur.detach(), requires_grad = True)
-
-            next_pp._pop_param = to_param(next_pop, pop_leaf)
-            next_pp._shared_param = to_param(next_shared, shared_leaf)
+        next_pp._set_leaves(next_leaves, functional = create_graph, orig = pp._leaf_pair)
         return next_pp
 
     # lifecycle hooks
 
     @torch.no_grad()
     def _on_populate(self, pop_size: int, *, init: Literal['reinit', 'clone'] | object, preserve_first: bool):
+        self._noop_cache = None
         pp, store = self._pp, self._store
 
         def expand(t: Tensor) -> Tensor:
@@ -944,11 +1144,12 @@ class PopulationOptimizer(Optimizer):
             return out
 
         old_state = self.named_state(pp, clone = True)
-        old_init = store['global/_init'].clone()
+        old_init = store['global/_init'][0].clone()
         cpu_keys = {(k, pname) for k, params in store.aux.items() for pname, meta in params.items() if meta.cpu_scalar}
+        py_types = {(k, pname): meta.py_type for k, params in store.aux.items() for pname, meta in params.items() if exists(meta.py_type)}
 
         store.clear(keep_hp = True)
-        self._alloc_from_probe(store, old_state, cpu_keys)
+        self._alloc_from_probe(store, old_state, cpu_keys, py_types)
 
         views, flags = store.all_views(), store['global/_init']
         for spec in pp._schema.trainable:
@@ -960,9 +1161,9 @@ class PopulationOptimizer(Optimizer):
 
         self._sync_optimizer_state()
 
-    def _clone_for_subpopulation(self, target_pop: Population, indices: list[int]) -> PopulationOptimizer:
+    def _clone_for_subpopulation(self, target_pop: Population, indices: list[int] | None = None) -> PopulationOptimizer:
         is_pop = self.population.is_population
-        kwargs = self._resolve_kwargs(index = indices if is_pop else None)
+        kwargs = self._resolve_kwargs(index = indices if (is_pop and exists(indices)) else None)
         dst_pp = target_pop.population_parameters
 
         sub = PopulationOptimizer.__new__(PopulationOptimizer)
@@ -970,10 +1171,11 @@ class PopulationOptimizer(Optimizer):
         for attr in ('opt_cls', '_opt_args', 'name', '_share_all', '_shared_reduce', '_accepted_kwargs', '_can_batch', '_can_batch_hetero'):
             setattr(sub, attr, getattr(self, attr))
         sub._shared_keys = set(self._shared_keys)
+        sub._noop_cache = None
         dst_pp._optimizers[self.name] = sub
 
         Optimizer.__init__(sub, sub._leaf_params(), kwargs)
-        if is_pop:
+        if is_pop or not target_pop.is_population:
             sub._sync_optimizer_state()
         else:
             sub_store = self._store.clone_handle(dst_pp)
@@ -992,8 +1194,8 @@ class PopulationOptimizer(Optimizer):
             if key.startswith('hp/') or key not in src_opt._store:
                 continue
             src = src_opt._store[key]
-            src_is_pop = src_opt._store.is_populated(key, src_opt._pp.pop_size)
-            if self._store.is_populated(key, self._pp.pop_size):
+            src_is_pop = src_opt._store.is_populated(key)
+            if self._store.is_populated(key):
                 dst[dst_indices] = (src[src_indices] if src_is_pop else src).to(dst)
             else:
                 dst.copy_((src[src_indices[-1]] if src_is_pop else src).to(dst))

@@ -639,3 +639,332 @@ def test_autograd_multi_loss_pcgrad_and_functional_step_grads():
     assert not torch.allclose(scoped_pp.named_parameters_dict()['2.weight'], w2_before)
     assert scoped_pp.opt_aux('step', '0.weight').sum().item() == 0.
     assert (scoped_pp.opt_aux('step', '2.weight') == 1.).all()
+
+def test_functional_step_subset_members():
+    torch.manual_seed(18)
+    pop = Population(mlp(), pop_size = 4)
+    opt = pop.optimizer(torch.optim.Adam, lr = 1e-2)
+    meta = nn.Linear(4, 4)
+    pp0 = pop.population_parameters
+    w_before = pp0.flat_params.detach().clone()
+
+    x = torch.randn(4, 6, 8)
+    out = pop(x, params = pp0, per_individual = True)
+    loss = (out - meta(torch.ones(6, 4)).unsqueeze(0)).pow(2).mean()
+    pp1 = opt.functional_step(loss, pp0, members = (0, 2), create_graph = True)
+
+    assert not torch.allclose(pp1.flat_params[0], w_before[0])
+    assert not torch.allclose(pp1.flat_params[2], w_before[2])
+    assert torch.equal(pp1.flat_params[1], w_before[1])
+    assert torch.equal(pp1.flat_params[3], w_before[3])
+    assert torch.allclose(pp1.opt_aux('step', '0.weight'), torch.tensor([1., 0., 1., 0.]))
+    assert pp1.opt_slot_flat('exp_avg')[0].norm() > 0
+    assert pp1.opt_slot_flat('exp_avg')[1].norm() == 0
+
+    # meta-gradients flow through updated subset members
+    pop(x, params = pp1, per_individual = True).pow(2).mean().backward()
+    assert meta.weight.grad is not None and meta.weight.grad.abs().sum() > 0
+
+
+class PyScalarStepOpt(torch.optim.Optimizer):
+    '''Minimal optimizer storing Python int/float state (like AdoptAtan2's steps) and lazy param_init.'''
+    def __init__(self, params, lr = 1e-2, beta = 0.9, regen = 1e-3):
+        super().__init__(params, dict(lr = lr, beta = beta, regen = regen))
+
+    @torch.no_grad()
+    def step(self, closure = None):
+        for group in self.param_groups:
+            lr, beta, regen = group['lr'], group['beta'], group['regen']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                st = self.state[p]
+                if len(st) == 0:
+                    st['steps'] = 0
+                    st['scale'] = 1.0
+                    st['exp_avg'] = torch.zeros_like(p)
+                    st['param_init'] = p.data.clone()
+                if st['steps'] == 0:
+                    st['exp_avg'].copy_(p.grad)
+                    st['steps'] += 1
+                    continue
+                st['exp_avg'].mul_(beta).add_(p.grad, alpha = 1. - beta)
+                p.add_(st['exp_avg'], alpha = -lr * st['scale'])
+                p.lerp_(st['param_init'], lr * regen)
+                st['steps'] += 1
+                st['scale'] = 0.99 * st['scale']
+
+
+class OutOfPlaceStateOpt(torch.optim.Optimizer):
+    '''Optimizer that replaces state tensors out-of-place instead of mutating in-place.'''
+    def __init__(self, params, lr = 1e-2, beta = 0.9):
+        super().__init__(params, dict(lr = lr, beta = beta))
+
+    @torch.no_grad()
+    def step(self, closure = None):
+        for group in self.param_groups:
+            lr, beta = group['lr'], group['beta']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                st = self.state[p]
+                buf = st.get('buf', torch.zeros_like(p))
+                buf = beta * buf + (1. - beta) * p.grad
+                st['buf'] = buf
+                p.add_(buf, alpha = -lr)
+
+
+def test_python_scalar_state_and_noop_cache_lifecycle():
+    torch.manual_seed(19)
+    base = mlp()
+
+    # 1. noop parity (with flat autograd + LRScheduler + state_dict reload + dtype sync + reset)
+    m_ref, m_pop = deepcopy(base), deepcopy(base)
+    o_ref = PyScalarStepOpt(m_ref.parameters(), lr = 2e-2)
+    pop_noop = Population(m_pop)
+    o_pop = pop_noop.optimizer(PyScalarStepOpt, lr = 2e-2)
+    sched_ref = torch.optim.lr_scheduler.StepLR(o_ref, step_size = 2, gamma = 0.5)
+    sched_pop = torch.optim.lr_scheduler.StepLR(o_pop, step_size = 2, gamma = 0.5)
+
+    for _ in range(5):
+        x = torch.randn(6, 8)
+        m_ref(x).pow(2).mean().backward()
+        o_ref.step()
+        o_ref.zero_grad()
+        sched_ref.step()
+
+        g = o_pop.autograd(pop_noop(x).pow(2).mean(), flat = True)
+        o_pop.step(grads = g)
+        sched_pop.step()
+
+    for p1, p2 in zip(m_ref.parameters(), m_pop.parameters()):
+        assert torch.allclose(p1, p2, atol = 1e-6)
+    assert pop_noop.slot('0.weight').state['steps'].item() == 5
+
+    # state_dict save -> step -> reload restores exact trajectory (cache invalidated!)
+    snap = deepcopy(pop_noop.state_dict())
+    x_chk = torch.randn(6, 8)
+    pop_noop(x_chk).pow(2).mean().backward()
+    o_pop.step()
+    o_pop.zero_grad()
+    after_step = m_pop[0].weight.detach().clone()
+
+    pop_noop.load_state_dict(snap)
+    assert pop_noop.slot('0.weight').state['steps'].item() == 5
+    pop_noop(x_chk).pow(2).mean().backward()
+    o_pop.step()
+    o_pop.zero_grad()
+    assert torch.allclose(m_pop[0].weight, after_step, atol = 1e-6)
+
+    # dtype sync on noop net (.double())
+    m_pop.double()
+    x64 = torch.randn(6, 8, dtype = torch.float64)
+    g64 = o_pop.autograd(pop_noop(x64).pow(2).mean(), flat = True)
+    o_pop.step(grads = g64)
+    assert pop_noop.slot('0.weight').state['exp_avg'].dtype == torch.float64
+
+    # noop -> populate(3) preserves py_type metadata & continues stepping
+    m_pop.float()
+    pop_noop.populate(3, init = 'clone')
+    o_pop.step(grads = o_pop.autograd(pop_noop(torch.randn(6, 8)).pow(2).mean(), flat = True))
+    assert (pop_noop.slot('0.weight').state['steps'] == 8).all()
+
+    # 2. populated parity (uniform batched + post-reset hetero fallback + extract + share)
+    refs = [mlp() for _ in range(3)]
+    ref_opts = [PyScalarStepOpt(m.parameters(), lr = 2e-2) for m in refs]
+    pop = Population([deepcopy(m) for m in refs])
+    opt = pop.optimizer(PyScalarStepOpt, lr = 2e-2)
+    assert opt._can_batch and not opt._can_batch_hetero
+
+    for _ in range(4):
+        x = torch.randn(3, 6, 8)
+        for i, (m, o) in enumerate(zip(refs, ref_opts)):
+            m(x[i]).pow(2).mean().backward()
+            o.step()
+            o.zero_grad()
+        g = opt.autograd(pop(x, per_individual = True).pow(2).mean(dim = (1, 2)).sum(), flat = True)
+        opt.step(grads = g)
+
+    for i, m in enumerate(refs):
+        for p1, p2 in zip(m.parameters(), pop[i].parameters()):
+            assert torch.allclose(p1, p2, atol = 1e-6)
+
+    # partial reset creates heterogeneous step counts (0 vs 4) -> clean per-member fallback
+    opt.reset(0)
+    ref_opts[0] = PyScalarStepOpt(refs[0].parameters(), lr = 2e-2)
+    for _ in range(3):
+        x = torch.randn(3, 6, 8)
+        for i, (m, o) in enumerate(zip(refs, ref_opts)):
+            m(x[i]).pow(2).mean().backward()
+            o.step()
+            o.zero_grad()
+        pop(x, per_individual = True).pow(2).mean(dim = (1, 2)).sum().backward()
+        opt.step()
+        opt.zero_grad()
+
+    for i, m in enumerate(refs):
+        for p1, p2 in zip(m.parameters(), pop[i].parameters()):
+            assert torch.allclose(p1, p2, atol = 1e-6)
+
+    # extract returns native Python int/float state & continues with exact parity
+    ind, ind_opt = pop.extract(1)
+    first_p = next(ind.parameters())
+    assert type(ind_opt.state[first_p]['steps']) is int
+    assert type(ind_opt.state[first_p]['scale']) is float
+    x1 = torch.randn(6, 8)
+    ind(x1).pow(2).mean().backward()
+    ind_opt.step()
+    refs[1](x1).pow(2).mean().backward()
+    ref_opts[1].step()
+    for p1, p2 in zip(refs[1].parameters(), ind.parameters()):
+        assert torch.allclose(p1, p2, atol = 1e-6)
+
+    # share / unshare works with py_type aux state
+    opt.share(reduce = 'max')
+    opt.step(grads = opt.autograd(pop(torch.randn(6, 8)).pow(2).mean(), flat = True))
+    opt.unshare()
+    opt.step(grads = opt.autograd(pop(torch.randn(6, 8)).pow(2).mean(), flat = True))
+
+    # 3. out-of-place state tensor replacement in noop mode stays synced with store
+    m_oop_ref, m_oop = deepcopy(base), deepcopy(base)
+    o_oop_ref = OutOfPlaceStateOpt(m_oop_ref.parameters(), lr = 2e-2)
+    pop_oop = Population(m_oop)
+    o_oop = pop_oop.optimizer(OutOfPlaceStateOpt, lr = 2e-2)
+    for _ in range(4):
+        x = torch.randn(6, 8)
+        m_oop_ref(x).pow(2).mean().backward()
+        o_oop_ref.step()
+        o_oop_ref.zero_grad()
+        o_oop.step(grads = o_oop.autograd(pop_oop(x).pow(2).mean(), flat = True))
+    for p1, p2 in zip(m_oop_ref.parameters(), m_oop.parameters()):
+        assert torch.allclose(p1, p2, atol = 1e-6)
+    assert pop_oop.slot('0.weight').state['buf'].norm() > 0
+
+
+def test_multi_loss_flat_autograd_damper_noop_and_populated():
+    torch.manual_seed(20)
+
+    def damper(g_r: torch.Tensor, g_t: torch.Tensor, eta: float = 0.5) -> torch.Tensor:
+        n_r = g_r.norm(dim = -1, keepdim = True).clamp(min = 1e-8)
+        n_t = g_t.norm(dim = -1, keepdim = True).clamp(min = 1e-8)
+        dot = (g_r * g_t).sum(dim = -1, keepdim = True).clamp(max = 0.)
+        g_t_proj = g_t - (dot / n_r.square()) * g_r
+        weight = (n_t / n_r).clamp(max = 1.).pow(1. - eta)
+        return g_r + (n_r / n_t) * weight * g_t_proj
+
+    s, s_next = torch.randn(8, 8), torch.randn(8, 8)
+
+    # identical code works in noop (D,) and populated (P, D)
+    for pop_size in (None, 3):
+        pop = Population(mlp(), pop_size = pop_size)
+        opt = pop.optimizer(torch.optim.AdamW, lr = 1e-2)
+
+        y, y_next = pop(s), pop(s_next)
+        loss_r = y.pow(2).mean()
+        loss_t = (y_next - y).pow(2).mean()
+
+        g_r, g_t = opt.autograd(loss_r, loss_t, flat = True)
+        expected_ndim = 1 if pop_size is None else 2
+        assert g_r.ndim == expected_ndim and g_r.shape == pop.population_parameters.flat_params.shape
+
+        # Theorem 1: g_damper . g_r >= ||g_r||^2
+        g = damper(g_r, g_t, eta = 0.5)
+        assert ((g * g_r).sum(dim = -1) >= g_r.pow(2).sum(dim = -1) - 1e-5).all()
+        opt.step(grads = g)
+
+        # sequence form always returns a tuple (even for length 1)
+        (g_single,) = pop.autograd([pop(s).pow(2).mean()], flat = True)
+        assert g_single.shape == g_r.shape
+
+        # detached/zero-grad loss returns exact zeros; scoped names zero non-target params
+        g_zero = opt.autograd(torch.tensor(0.), flat = True)
+        assert g_zero.shape == g_r.shape and g_zero.abs().sum() == 0
+
+        g_scoped = opt.autograd(pop(s).pow(2).mean(), names = ('2.bias',), flat = True)
+        unpacked = pop.population_parameters.unpack_flat(g_scoped)
+        assert unpacked['0.weight'].abs().sum() == 0 and unpacked['2.bias'].abs().sum() > 0
+
+    # differentiable multi-loss flat autograd + functional_step
+    pop = Population(mlp(), pop_size = 2)
+    opt = pop.optimizer(torch.optim.Adam, lr = 1e-2)
+    eta = nn.Parameter(torch.tensor(0.5))
+    pp = pop.population_parameters
+    y, y_next = pop(s, params = pp), pop(s_next, params = pp)
+    g_r, g_t = opt.autograd(y.pow(2).mean(), (y_next - y).pow(2).mean(), params = pp, flat = True, create_graph = True)
+    next_pp = opt.functional_step(grads = damper(g_r, g_t, eta = eta), params = pp, create_graph = True)
+    pop(s, params = next_pp).pow(2).mean().backward()
+    assert eta.grad is not None and eta.grad.isfinite()
+
+
+def test_multi_optimizer_unrolled_backprop_and_ltm_consolidation():
+    torch.manual_seed(25)
+    make_double = lambda: mlp().double()
+    x_tr = torch.randn(4, 6, 8, dtype = torch.float64)
+    x_val = torch.randn(4, 6, 8, dtype = torch.float64)
+
+    pop = Population(make_double, pop_size = 4)
+    ltm = pop.clone(include_opt = False)
+    ltm_opt = ltm.optimizer(torch.optim.AdamW, lr = 1e-1)
+    ltm_solo = Population(pop[0])
+
+    opt_sgd   = pop.optimizer(torch.optim.SGD, lr = 5e-2, momentum = 0.9, name = 'sgd')
+    opt_rms   = pop.optimizer(torch.optim.RMSprop, lr = 1e-2, name = 'rms')
+    opt_adamw = pop.optimizer(torch.optim.AdamW, lr = 1e-2, name = 'adamw')
+    meta_target = nn.Parameter(torch.randn(1, 1, 4, dtype = torch.float64))
+
+    # 1. Exact finite-difference check through SGD(momentum=0.9) -> RMSprop -> AdamW
+    def unroll(target_val, *, create_graph = True):
+        fast = pop.population_parameters
+        for step_opt in (opt_sgd, opt_rms, opt_adamw):
+            loss = (pop(x_tr, params = fast, per_individual = True) - target_val).pow(2).mean()
+            fast = step_opt.functional_step(loss, fast, create_graph = create_graph, detach_preconditioner = False)
+        return pop(x_val, params = fast, per_individual = True).pow(2).mean(), fast
+
+    meta_loss, fast = unroll(meta_target, create_graph = True)
+    meta_loss.backward()
+    g_meta = meta_target.grad.clone()
+
+    eps = 1e-6
+    t_plus, t_minus = meta_target.detach().clone(), meta_target.detach().clone()
+    t_plus[0, 0, 0] += eps
+    t_minus[0, 0, 0] -= eps
+    fd = (unroll(t_plus, create_graph = False)[0] - unroll(t_minus, create_graph = False)[0]) / (2 * eps)
+    assert ((g_meta[0, 0, 0] - fd).abs() / fd.abs().clamp(min = 1e-12)) < 1e-4
+
+    # 2. LTM consolidation for an individual via view lerp_, standalone lerp_, Reptile outer opt, and colocated ema_
+    w0_before = ltm.view(0).flat_params.detach().clone()
+    w1_before = ltm.view(1).flat_params.detach().clone()
+    ltm.view(0).lerp_(fast, 0.1)
+    assert torch.allclose(ltm.view(0).flat_params, w0_before.lerp(fast.flat_params[0].detach(), 0.1), atol = 1e-12)
+    assert torch.equal(ltm.view(1).flat_params, w1_before)
+
+    w0_solo = ltm_solo.flat_params.detach().clone()
+    ltm_solo.lerp_(fast[0], 0.1)
+    assert torch.allclose(ltm_solo.flat_params, w0_solo.lerp(fast.flat_params[0].detach(), 0.1), atol = 1e-12)
+
+    # cross-member view lerp_ (individual 2 -> individual 0's LTM)
+    w0_mid = ltm.view(0).flat_params.detach().clone()
+    ltm.view(0).lerp_(pop.view(2), 0.25)
+    assert torch.allclose(ltm.view(0).flat_params, w0_mid.lerp(pop.view(2).flat_params.detach(), 0.25), atol = 1e-12)
+
+    w2_before = ltm.view(2).flat_params.detach().clone()
+    ltm_opt.step(grads = ltm.flat_params - fast.flat_params.detach(), members = 2)
+    assert not torch.allclose(ltm.view(2).flat_params, w2_before)
+    assert torch.equal(ltm.view(1).flat_params, w1_before)
+
+    ltm_coloc = pop.view(0).ema_('ltm', fast.flat_params[0], decay = 0.9)
+    assert torch.allclose(ltm_coloc, fast.flat_params[0].detach())
+    assert pop(x_val[0], params = pop.view(0).tracked('ltm')).shape == (6, 4)
+
+    # 3. Heterogeneous optimizers per member in one inner loop (0,1=AdamW; 2,3=RMSprop)
+    meta_target.grad = None
+    pop.zero_grad()
+    fast_h = pop.population_parameters
+    for _ in range(2):
+        l_a = (pop(x_tr, params = fast_h, per_individual = True) - meta_target).pow(2).mean()
+        fast_h = opt_adamw.functional_step(l_a, fast_h, members = (0, 1), create_graph = True)
+        l_b = (pop(x_tr, params = fast_h, per_individual = True) - meta_target).pow(2).mean()
+        fast_h = opt_rms.functional_step(l_b, fast_h, members = (2, 3), create_graph = True)
+    pop(x_val, params = fast_h, per_individual = True).pow(2).mean().backward()
+    assert meta_target.grad.isfinite().all() and meta_target.grad.abs().sum() > 0
+    assert (pop.population_parameters._pop_param.grad.abs().sum(dim = -1) > 0).all()

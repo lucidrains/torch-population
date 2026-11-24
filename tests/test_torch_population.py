@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import pytest
 import torch
 from torch import nn
@@ -403,6 +405,12 @@ def test_per_individual_default_requires_grad_and_selectors():
     assert torch.equal(pop.params_dict['weight'][1], w_before[0])
     pop.replace(2, pop.view(0))
     assert torch.equal(pop.params_dict['weight'][2], pop.params_dict['weight'][0])
+    with pytest.raises(ValueError):
+        pop.replace(2, pop.view([0, 1]))
+
+    pop[0:2] = pop.view([2, 3])
+    assert torch.equal(pop.params_dict['weight'][0], pop.params_dict['weight'][2])
+    assert torch.equal(pop.params_dict['weight'][1], pop.params_dict['weight'][3])
 
     # requires_grad preserved under no_grad() and in mean()
     with torch.no_grad():
@@ -419,3 +427,229 @@ def test_per_individual_default_requires_grad_and_selectors():
     pop_deep = Population(deep, pop_size = 2, shared = ('0.bias',))
     assert pop_deep.population_parameters.is_shared_param('0.bias')
     assert not pop_deep.population_parameters.is_shared_param('10.bias')
+
+def test_call_arbitrary_methods_shared_buffers_and_reduce():
+    torch.manual_seed(21)
+    net = TwoBranchNet()
+    x = torch.randn(5, 8)
+
+    # noop call by method name & callable
+    noop = Population(net)
+    assert torch.equal(noop.call('encode', x), net.encode(x))
+    assert torch.equal(noop.call(lambda m, t: m.encode(t) * 2., x), net.encode(x) * 2.)
+
+    # population call with shared submodule + shared buffer
+    pop = Population(net, pop_size = 4, shared = ('encoder', 'scale'))
+    pp = pop.population_parameters
+    assert pp.is_shared_param('encoder.0.weight')
+    assert pp.is_shared_buffer('scale')
+    assert not pp.is_shared_buffer('temp')
+    assert pop.buffers_dict['scale'].shape == ()
+    assert pop.buffers_dict['temp'].shape == (4,)
+
+    h = pop.call('encode', x)
+    assert h.shape == (4, 5, 16)
+    assert torch.allclose(h[0], h[3], atol = 1e-6)
+    assert torch.allclose(h[1], pop[1].encode(x), atol = 1e-6)
+
+    # subset, per_individual, callable & live view call
+    x_sub = torch.randn(2, 5, 8)
+    h_sub = pop.call('encode', x_sub, members = (1, 3), per_individual = True)
+    assert h_sub.shape == (2, 5, 16)
+    assert torch.allclose(h_sub[0], pop[1].encode(x_sub[0]), atol = 1e-6)
+    assert torch.allclose(h_sub[1], pop[3].encode(x_sub[1]), atol = 1e-6)
+
+    scaled = pop.call(lambda m, t: m.head(m.encode(t)) * m.scale, x)
+    for i in range(4):
+        assert torch.allclose(scaled[i], pop[i].head(pop[i].encode(x)) * pop[i].scale, atol = 1e-5)
+
+    assert torch.allclose(pop.view(2).call('encode', x), pop[2].encode(x), atol = 1e-6)
+    assert torch.allclose(pop.view([0, 2]).call('encode', x)[1], pop[2].encode(x), atol = 1e-6)
+
+    # lifecycle preserves shared buffer shape
+    pop.reset_(torch.tensor([True, False, False, False]))
+    pop.delete(1)
+    pop.append(0)
+    assert pop.buffers_dict['scale'].shape == ()
+    assert pop.buffers_dict['temp'].shape == (4,)
+
+    # generalized pop.reduce (median, max, custom callable)
+    med = pop.reduce('median')
+    assert torch.allclose(med.head.weight, pop.params_dict['head.weight'].median(dim = 0).values)
+    assert torch.allclose(med.scale, pop.buffers_dict['scale'])
+    hi = pop.reduce('max')
+    assert torch.allclose(hi.head.weight, pop.params_dict['head.weight'].amax(dim = 0))
+    custom = pop.reduce(lambda t: 0.25 * t[0] + 0.75 * t[-1])
+    assert torch.allclose(custom.head.weight, 0.25 * pop.params_dict['head.weight'][0] + 0.75 * pop.params_dict['head.weight'][-1])
+
+
+def test_clone_lerp_and_ema_noop_and_populated():
+    torch.manual_seed(22)
+    x = torch.randn(6, 8)
+
+    # 1. noop clone (include_opt=False/True), lerp_, and tracked grad EMA + lifecycle
+    net = mlp()
+    pop = Population(net)
+    opt = pop.optimizer(torch.optim.AdamW, lr = 1e-2)
+
+    ema = pop.clone(include_opt = False)
+    assert not ema.is_population and ema.unwrap() is not net and ema.opt is None
+
+    w0 = pop.flat_params.detach().clone()
+    g1 = opt.autograd(pop(x).pow(2).mean(), flat = True)
+    g_ema = opt.ema_('grad', g1, decay = 0.9)
+    assert torch.allclose(g_ema, g1)  # first obs initializes directly (no zero bias)
+    opt.step(grads = g1 + 0.5 * g_ema)
+
+    w1 = pop.flat_params.detach().clone()
+    ema.lerp_(pop, 0.25)
+    assert torch.allclose(ema.flat_params, w0.lerp(w1, 0.25), atol = 1e-6)
+
+    g2 = opt.autograd(pop(x).pow(2).mean(), flat = True)
+    g_ema = pop.ema_('grad', g2, decay = 0.9)
+    assert torch.allclose(g_ema, g1.lerp(g2, 0.1), atol = 1e-6)
+
+    # noop clone with include_opt=True forks independent optimizer & tracked buffers
+    fork = pop.clone(include_opt = True)
+    assert fork.opt is not None and fork.opt is not opt
+    assert torch.allclose(fork.tracked('grad'), g_ema)
+    fork.opt.step(grads = fork.opt.autograd(fork(x).pow(2).mean(), flat = True))
+    assert not torch.allclose(fork.flat_params, pop.flat_params)
+
+    # noop dtype sync on ema_ + populate carries tracked EMAs
+    net.double()
+    g_double = opt.autograd(pop(x.double()).pow(2).mean(), flat = True)
+    assert pop.ema_('grad', g_double, decay = 0.5).dtype == torch.float64
+    net.float()
+    pop.ema_('grad', torch.ones_like(g1), decay = 0.0)
+    pop.populate(3, init = 'reinit', keep_first = True)
+    assert pop.tracked('grad').shape == (3, g1.numel())
+    assert torch.allclose(pop.tracked('grad')[0], torch.ones_like(g1))
+    # newly reinit slots 1,2 have init=False so next ema_ initializes them cleanly without zero-bias
+    obs = torch.stack([torch.full_like(g1, 3.), torch.full_like(g1, 5.), torch.full_like(g1, 7.)])
+    pop.ema_('grad', obs, decay = 0.5)
+    assert torch.allclose(pop.tracked('grad')[0], torch.full_like(g1, 2.))  # 0.5 * 1 + 0.5 * 3
+    assert torch.allclose(pop.tracked('grad')[1], torch.full_like(g1, 5.))  # fresh init!
+    assert torch.allclose(pop.tracked('grad')[2], torch.full_like(g1, 7.))  # fresh init!
+
+    # 2. populated multi-timescale lerp_, subset lerp_, per-member ema_ decays & full lifecycle
+    pop4 = Population(mlp, pop_size = 4)
+    opt4 = pop4.optimizer(torch.optim.AdamW, lr = 1e-2)
+    ema4 = pop4.clone(include_opt = False)
+
+    g = opt4.autograd(pop4(x).pow(2).mean(), flat = True)
+    opt4.step(grads = g)
+
+    # per-member multi-timescale lerp_ + subset lerp_
+    w_ema_before = ema4.flat_params.detach().clone()
+    w_online = pop4.flat_params.detach().clone()
+    taus = torch.tensor([0.0, 0.25, 0.5, 1.0])
+    ema4.lerp_(pop4, taus)
+    for i, tau in enumerate(taus.tolist()):
+        assert torch.allclose(ema4.flat_params[i], w_ema_before[i].lerp(w_online[i], tau), atol = 1e-6)
+
+    ema4.lerp_(pop4, 0.5, members = (0, 2))
+    assert torch.allclose(ema4.flat_params[1], w_ema_before[1].lerp(w_online[1], 0.25), atol = 1e-6)  # untouched
+
+    # per-member decay on ema_, subset members, reset_, replace, delete, append, state_dict, slice
+    decays = torch.tensor([0.5, 0.8, 0.9, 0.99])
+    v0 = torch.ones_like(g)
+    v1 = torch.full_like(g, 11.)
+    pop4.ema_('g', v0, decay = decays)
+    pop4.ema_('g', v1, decay = decays, members = (0, 2))
+    assert torch.allclose(pop4.tracked('g')[0], torch.full_like(g[0], 6.))     # 1 -> 11 @ 0.5
+    assert torch.allclose(pop4.tracked('g')[1], torch.ones_like(g[1]))         # untouched
+    assert torch.allclose(pop4.tracked('g')[2], torch.full_like(g[2], 2.))     # 1 -> 11 @ 0.9
+
+    # reset_(1) clears slot 1 so its next observation initializes fresh (no zero-bias)
+    pop4.reset_(1)
+    assert pop4.tracked('g')[1].abs().sum() == 0
+    pop4.ema_('g', torch.full_like(g, 4.), decay = 0.9)
+    assert torch.allclose(pop4.tracked('g')[1], torch.full_like(g[1], 4.))
+
+    # state_dict round-trip + slice + delete + append
+    sd = {k: v.clone() for k, v in pop4.state_dict().items()}
+    pop4_copy = pop4.clone(include_opt = False)
+    pop4_copy.clear_tracked('g')
+    assert pop4_copy.tracked('g') is None
+    pop4.replace(3, 0, reset_opt = False)
+    assert torch.allclose(pop4.tracked('g')[3], pop4.tracked('g')[0])
+    sub = pop4[:2]
+    assert sub.tracked('g').shape == (2, g.shape[-1])
+    pop4.delete(1)
+    assert pop4.tracked('g').shape == (3, g.shape[-1])
+    pop4.append(0)
+    assert pop4.tracked('g').shape == (4, g.shape[-1])
+    # newly appended slot 3 has init=False -> takes fresh obs directly
+    pop4.ema_('g', torch.full((4, g.shape[-1]), 9.), decay = 0.9)
+    assert torch.allclose(pop4.tracked('g')[3], torch.full_like(g[0], 9.))
+    assert 'population_parameters.store.k/track/g' in sd
+
+
+def test_flat_params_dispatch_sam_es_soup_and_colocated_param_ema():
+    torch.manual_seed(23)
+    x = torch.randn(6, 8)
+
+    # 1. SAM in 4 lines — exact parity with manual perturb-and-grad (noop AND populated)
+    for pop_size in (None, 3):
+        net = TwoBranchNet()
+        pop = Population(net, pop_size = pop_size, shared = ('encoder',) if pop_size else ())
+        opt = pop.optimizer(torch.optim.SGD, lr = 1e-2)
+        rho = 0.05
+
+        g = opt.autograd(pop(x).pow(2).mean(), flat = True)
+        eps = rho * g / g.norm(dim = -1, keepdim = True).clamp(min = 1e-8)
+        g_sam = opt.autograd(pop(x, params = pop.flat_params + eps.detach()).pow(2).mean(), flat = True)
+
+        # verify against explicit perturbation on a clone
+        ref = pop.clone(include_opt = False)
+        with torch.no_grad():
+            if pop_size is None:
+                for p, e in zip((p for p in ref.unwrap().parameters() if p.requires_grad), ref.population_parameters.unpack_flat(eps).values()):
+                    p.add_(e)
+            else:
+                ref.population_parameters._pop_param.add_(eps)
+        g_ref = ref.autograd(ref(x).pow(2).mean(), flat = True)
+        assert torch.allclose(g_sam, g_ref, atol = 1e-5)
+
+        # colocated flat param EMA runnable directly via params=p_ema
+        p_ema = pop.ema_('param', pop.flat_params, decay = 0.99)
+        opt.step(grads = g_sam)
+        out_ema = pop(x, params = p_ema)
+        assert out_ema.shape == pop(x).shape
+
+    # 2. Vectorized Evolution Strategies (K=8 perturbations on a single noop model!)
+    net = mlp()
+    pop = Population(net)
+    opt = pop.optimizer(torch.optim.AdamW, lr = 1e-2)
+    D = pop.flat_params.numel()
+    sigma = 0.05
+    noise = torch.randn(8, D)
+    thetas = pop.flat_params.detach() + sigma * noise  # (8, D)
+
+    outs = pop(x, params = thetas)  # vmapped across 8 perturbations!
+    assert outs.shape == (8, 6, 4)
+
+    # exact parity with manual forward on each perturbed copy
+    for k in range(8):
+        m = deepcopy(net)
+        with torch.no_grad():
+            for p, val in zip((p for p in m.parameters() if p.requires_grad), pop.population_parameters.unpack_flat(thetas[k]).values()):
+                p.copy_(val)
+        assert torch.allclose(outs[k], m(x), atol = 1e-5)
+
+    rewards = -outs.pow(2).mean(dim = (1, 2))
+    g_es = -(rewards[:, None] * noise).mean(dim = 0) / sigma
+    w_before = pop.flat_params.detach().clone()
+    opt.step(grads = g_es)
+    assert not torch.allclose(pop.flat_params, w_before)
+
+    # 3. Differentiable 1D model soup evaluation on a populated Population
+    pop3 = Population(mlp, pop_size = 3)
+    soup_theta = pop3.flat_params.mean(dim = 0)  # (D,)
+    soup_out = pop3(x, params = soup_theta)
+    assert soup_out.shape == (6, 4)
+    assert torch.allclose(soup_out, pop3.mean()(x), atol = 1e-5)
+    soup_out.pow(2).mean().backward()
+    assert pop3.population_parameters._pop_param.grad is not None
+    assert pop3.population_parameters._pop_param.grad.abs().sum() > 0
