@@ -968,3 +968,140 @@ def test_multi_optimizer_unrolled_backprop_and_ltm_consolidation():
     pop(x_val, params = fast_h, per_individual = True).pow(2).mean().backward()
     assert meta_target.grad.isfinite().all() and meta_target.grad.abs().sum() > 0
     assert (pop.population_parameters._pop_param.grad.abs().sum(dim = -1) > 0).all()
+
+
+@param('opt_cls,kw', [
+    (torch.optim.Adam, dict(lr = 1e-2)),
+    (torch.optim.AdamW, dict(lr = 1e-2, weight_decay = 1e-2)),
+    (torch.optim.SGD, dict(lr = 5e-2, momentum = 0.9)),
+    (torch.optim.RMSprop, dict(lr = 1e-2)),
+])
+def test_batched_subset_step_parity_and_functional(opt_cls, kw):
+    torch.manual_seed(400)
+    x = torch.randn(5, 6, 8)
+    pop_fast = Population(mlp, pop_size = 5)
+    pop_ref = pop_fast.clone(include_opt = False)
+
+    opt_fast = pop_fast.optimizer(opt_cls, **kw)
+    opt_ref = pop_ref.optimizer(opt_cls, per_individual = True, **kw)
+    assert opt_fast._can_batch
+
+    # guard that batched path actually fires on subset steps (never falls back to _step_group)
+    orig_step_group = opt_fast._step_group
+    def forbid_fallback(*args, **kwargs):
+        raise AssertionError('subset step unexpectedly fell back to _step_group')
+    opt_fast._step_group = forbid_fallback
+
+    # 1. uniform fresh subset, uniform warm subset, size-1 subset, reset + heterogeneous subset
+    schedules = [
+        ([0, 2, 4], None),
+        ([0, 2, 4], None),
+        ([3], None),
+        ([1, 3], 'subset_flat'),
+        ([0, 1, 2], 'full_flat'),
+        ([2, 4], 'mapping'),
+    ]
+    for step_idx, (members, grad_mode) in enumerate(schedules):
+        if step_idx == 4:
+            # reset member 0 so [0, 1, 2] has heterogeneous step counts
+            opt_fast.reset(0)
+            opt_ref.reset(0)
+
+        for p, o in ((pop_fast, opt_fast), (pop_ref, opt_ref)):
+            o.zero_grad()
+            if grad_mode is None:
+                p(x[members], members = members, per_individual = True).pow(2).mean().backward()
+                o.step(members = members)
+            elif grad_mode == 'subset_flat':
+                g = torch.full((len(members), p.flat_params.shape[-1]), 0.1 * (step_idx + 1))
+                o.step(grads = g, members = members)
+            elif grad_mode == 'full_flat':
+                g = torch.arange(1, 6, dtype = torch.float32)[:, None].expand_as(p.flat_params) * 0.05
+                o.step(grads = g, members = members)
+            else:
+                g_map = {k: torch.full_like(v, 0.05) for k, v in p.params_dict.items()}
+                o.step(grads = g_map, members = members)
+
+        assert torch.allclose(pop_fast.flat_params, pop_ref.flat_params, atol = 1e-5, rtol = 1e-4)
+
+    # 2. single-member 1D flat grad
+    g1 = torch.full((pop_fast.flat_params.shape[-1],), 0.03)
+    opt_fast.step(grads = g1, members = 2)
+    opt_ref.step(grads = g1, members = 2)
+    assert torch.allclose(pop_fast.flat_params, pop_ref.flat_params, atol = 1e-5, rtol = 1e-4)
+
+    # 3. differentiable functional_step on subset members hits batched path with exact meta-grad parity
+    x_tr = torch.randn(5, 6, 8)
+    target = torch.randn(5, 6, 4, requires_grad = True)
+    sub_members = [1, 3]
+
+    def run_meta(pop_obj, opt_obj, tgt):
+        pp = pop_obj.population_parameters
+        for _ in range(2):
+            loss = (pop_obj(x_tr, params = pp, per_individual = True) - tgt).pow(2).mean()
+            pp = opt_obj.functional_step(loss, pp, members = sub_members, create_graph = True)
+        return pop_obj(x, params = pp, per_individual = True).pow(2).mean(), pp
+
+    t_fast = target.detach().clone().requires_grad_(True)
+    t_ref = target.detach().clone().requires_grad_(True)
+    loss_f, pp_f = run_meta(pop_fast, opt_fast, t_fast)
+    loss_r, pp_r = run_meta(pop_ref, opt_ref, t_ref)
+    loss_f.backward()
+    loss_r.backward()
+
+    assert torch.allclose(pp_f.flat_params, pp_r.flat_params, atol = 1e-5, rtol = 1e-4)
+    assert torch.allclose(t_fast.grad, t_ref.grad, atol = 1e-5, rtol = 1e-4)
+
+    # 4. shared optimizer state + subset step parity
+    opt_fast._step_group = orig_step_group
+    opt_fast.share()
+    opt_ref.share()
+    opt_fast._step_group = forbid_fallback
+    for p, o in ((pop_fast, opt_fast), (pop_ref, opt_ref)):
+        o.zero_grad()
+        p(x[[0, 2]], members = [0, 2], per_individual = True).pow(2).mean().backward()
+        o.step(members = [0, 2])
+    assert torch.allclose(pop_fast.flat_params, pop_ref.flat_params, atol = 1e-5, rtol = 1e-4)
+
+
+def test_replace_preserves_optimizer_state_hps_and_tracks():
+    torch.manual_seed(401)
+    x = torch.randn(6, 8)
+    pop = Population(mlp, pop_size = 4)
+    opt = pop.optimizer(torch.optim.AdamW, lr = [1e-4, 5e-4, 2e-3, 1e-2])
+    pop.track_('age', torch.tensor([10, 20, 30, 40]))
+
+    # warm up member 0 and member 2 differently; leave member 3 unstepped
+    for _ in range(3):
+        opt.zero_grad()
+        pop.view(0)(x).pow(2).mean().backward()
+        opt.step(members = 0)
+    opt.zero_grad()
+    pop.view(2)(x).pow(2).mean().backward()
+    opt.step(members = 2)
+
+    # replace(3, 0, reset_opt=False) copies weights, opt state, _init, per-member lr, and tracked tensors
+    pop.replace(3, 0, reset_opt = False)
+    assert torch.equal(pop.flat_params[3], pop.flat_params[0])
+    assert torch.equal(pop.slot('0.weight').state['exp_avg'][3], pop.slot('0.weight').state['exp_avg'][0])
+    assert torch.equal(pop.slot('0.weight').state['step'][3], pop.slot('0.weight').state['step'][0])
+    assert pop.opt.param_groups[0]['lr'][3].item() == pytest.approx(1e-4)
+    assert pop.tracked('age')[3].item() == 10
+
+    # subsequent identical gradients keep member 3 and member 0 identical
+    g = torch.randn_like(pop.flat_params[0])
+    opt.step(grads = torch.stack((g, g)), members = [0, 3])
+    assert torch.allclose(pop.flat_params[3], pop.flat_params[0], atol = 1e-6)
+
+    # view.copy_from_(other_view, include_opt=True) also copies opt state & tracked metadata
+    pop.view(1).copy_from_(pop.view(2), include_opt = True)
+    assert torch.equal(pop.flat_params[1], pop.flat_params[2])
+    assert torch.equal(pop.slot('0.weight').state['step'][1], pop.slot('0.weight').state['step'][2])
+    assert pop.opt.param_groups[0]['lr'][1].item() == pytest.approx(2e-3)
+    assert pop.tracked('age')[1].item() == 30
+
+    # reset_opt=True still resets opt state and tracked metadata
+    pop.replace(3, 0, reset_opt = True)
+    assert pop.slot('0.weight').state['step'][3].item() == 0.
+    assert pop.slot('0.weight').state['exp_avg'][3].abs().sum() == 0.
+    assert pop.tracked('age')[3].item() == 0

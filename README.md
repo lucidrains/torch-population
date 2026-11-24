@@ -50,6 +50,7 @@ opt = pop.optimizer(torch.optim.AdamW, lr = 1e-3, shared = False)
 
 opt.zero_grad()
 pop(x).pow(2).mean().backward()
+pop.clip_grad_norm_(1.0)                                # per-individual grad clipping (optional members=, names=)
 opt.step()
 
 # toggle optimizer state sharing at runtime ('mean', 'max', 'min', 'median', 'sum', 'first', 'zero', callable, or per-key dict)
@@ -121,6 +122,7 @@ g = opt.autograd(pop(x).pow(2).mean(), flat = True)     # (D,) in noop, (P, D) i
 g_ema  = opt.ema_('grad', g, decay = 0.98)              # Grokfast / smoothed gradient
 fisher = opt.ema_('fisher', g.square(), decay = 0.99)   # online diagonal Fisher
 p_ema  = pop.ema_('param', pop.flat_params, decay = 0.995)
+ages   = pop.track_('age', torch.zeros(4, dtype = torch.long))  # dtype-agnostic lifecycle-synced metadata
 
 out_ema = pop(x, params = p_ema)                        # run forward directly with flat EMA weights
 ```

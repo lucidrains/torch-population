@@ -130,15 +130,23 @@ class PopulationView(Module):
         self._pop.copy_from_(other, members = self._index if self._pop.is_population else None, include_opt = include_opt, include_buffers = include_buffers)
         return self
 
-    def ema_(self, name: str, value: Tensor, decay: float | Tensor = 0.99) -> Tensor:
-        buf = self._pop.ema_(name, value, decay = decay, members = self._index if self._pop.is_population else None)
-        return buf[self._index] if (exists(buf) and self._pop.is_population and self._pop.population_parameters.store.is_populated(f'track/{name}', self._pop.pop_size)) else buf
-
-    def tracked(self, name: str) -> Tensor | None:
-        buf = self._pop.tracked(name)
+    def _slice_tracked(self, name: str, buf: Tensor | None) -> Tensor | None:
         if not exists(buf) or not self._pop.is_population:
             return buf
         return buf[self._index] if self._pop.population_parameters.store.is_populated(f'track/{name}', self._pop.pop_size) else buf
+
+    def ema_(self, name: str, value: Tensor, decay: float | Tensor = 0.99) -> Tensor:
+        return self._slice_tracked(name, self._pop.ema_(name, value, decay = decay, members = self._index if self._pop.is_population else None))
+
+    def track_(self, name: str, value) -> Tensor:
+        return self._slice_tracked(name, self._pop.track_(name, value, members = self._index if self._pop.is_population else None))
+
+    def tracked(self, name: str) -> Tensor | None:
+        return self._slice_tracked(name, self._pop.tracked(name))
+
+    def clip_grad_norm_(self, max_norm: float, norm_type: float = 2.0, **kwargs) -> Tensor:
+        out = self._pop.clip_grad_norm_(max_norm, norm_type = norm_type, members = self._index if self._pop.is_population else None, **kwargs)
+        return out[0] if (self._pop.is_population and self.is_single and out.ndim == 1 and out.numel() == 1) else out
 
     def reset_(self, **kwargs) -> PopulationView:
         self._pop.reset_(self._index if self._pop.is_population else None, **kwargs)
@@ -325,6 +333,9 @@ class Population(Module):
     def zero_grad(self, set_to_none: bool = True, *, members = None):
         self.population_parameters.zero_grad_(members = members, set_to_none = set_to_none)
 
+    def clip_grad_norm_(self, max_norm: float, norm_type: float = 2.0, **kwargs) -> Tensor:
+        return self.population_parameters.clip_grad_norm_(max_norm, norm_type = norm_type, **kwargs)
+
     def autograd(self, *losses: Tensor, params: PopulationParameters | None = None, **kwargs):
         return default(params, self.population_parameters).autograd(*losses, **kwargs)
 
@@ -378,6 +389,9 @@ class Population(Module):
 
     def ema_(self, name: str, value: Tensor, decay: float | Tensor = 0.99, *, members = None) -> Tensor:
         return self.population_parameters.ema_(name, value, decay = decay, members = members)
+
+    def track_(self, name: str, value, *, members = None) -> Tensor:
+        return self.population_parameters.track_(name, value, members = members)
 
     def tracked(self, name: str) -> Tensor | None:
         return self.population_parameters.tracked(name)

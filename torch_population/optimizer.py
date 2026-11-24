@@ -119,6 +119,28 @@ def filter_optimizer_kwargs(kwargs: dict, accepted: set[str] | None, *, differen
 def work_tensor(t: Tensor, inplace: bool, create_graph: bool) -> Tensor:
     return t.detach() if inplace else (t.clone() if create_graph else t.detach().clone())
 
+def write_pop_rows_(dst: Tensor, val: Tensor, indices: list[int] | None, *, inplace: bool) -> Tensor:
+    val = val.to(dst)
+    if not exists(indices):
+        if val.shape != dst.shape:
+            val = val.expand_as(dst)
+            return dst.copy_(val) if inplace else val.clone()
+        return dst.copy_(val) if (inplace and val is not dst) else val
+    if inplace:
+        dst[indices] = val
+        return dst
+    rows = val.expand(len(indices), *dst.shape[1:]) if val.ndim < dst.ndim else val
+    return scatter_pop(dst, indices, list(rows.unbind(0)))
+
+def match_flat_grad(grad: Tensor, active_indices: list[int] | None, pop_size: int) -> Tensor:
+    if not exists(active_indices):
+        return grad
+    if grad.ndim == 2 and grad.shape[0] in (pop_size, len(active_indices)):
+        return grad[active_indices] if grad.shape[0] == pop_size else grad
+    if grad.ndim == 1 and len(active_indices) == 1:
+        return grad.unsqueeze(0)
+    raise ValueError(f'grad shape {tuple(grad.shape)} incompatible with {len(active_indices)} active members')
+
 def match_grad(spec: TensorSpec, grad: Tensor, active_indices: list[int] | None, pop_size: int | None) -> Tensor:
     if not exists(pop_size):
         return grad
@@ -240,11 +262,19 @@ def probe_optimizer(opt_cls, opt_args: tuple, opt_kwargs: dict, specs: list[Tens
 
     return defaults, state, can_batch, can_batch_hetero
 
-def analyze_batched_state(store: OptStore, specs: list[TensorSpec], *, allow_hetero: bool) -> tuple[Literal['uniform', 'hetero'], bool] | None:
+def analyze_batched_state(
+    store: OptStore,
+    specs: list[TensorSpec],
+    *,
+    allow_hetero: bool,
+    active_indices: list[int] | None = None,
+) -> tuple[Literal['uniform', 'hetero'], bool] | None:
     if any(slot.groups.get('pop') != specs for slot in store.slots.values()):
         return None
 
     flags = store['global/_init'][:, [s.trainable_index for s in specs]]
+    if exists(active_indices):
+        flags = flags[active_indices]
     row_init = flags[:, 0]
     if not (flags == row_init[:, None]).all():
         return None
@@ -262,9 +292,11 @@ def analyze_batched_state(store: OptStore, specs: list[TensorSpec], *, allow_het
         ref = store[f'aux/{aux_key}/{first}']
         if ref.ndim != (0 if meta.shared else 1):
             return None
-        if any((t := store[f'aux/{aux_key}/{name}']).shape != ref.shape or not (t == ref).all() for name in rest):
+        sel = (lambda t: t[active_indices]) if (exists(active_indices) and not meta.shared) else (lambda t: t)
+        ref_sel = sel(ref)
+        if any((t := store[f'aux/{aux_key}/{name}']).shape != ref.shape or not (sel(t) == ref_sel).all() for name in rest):
             return None
-        if not meta.shared and not (ref == ref[0]).all():
+        if not meta.shared and not (ref_sel == ref_sel[0]).all():
             all_aux_uniform = False
 
     if row_init.all() and all_aux_uniform:
@@ -670,12 +702,18 @@ class PopulationOptimizer(Optimizer):
     def reconcile(self, *losses: Tensor, fn: Callable, params: PopulationParameters | None = None, **kwargs) -> Tensor:
         return default(params, self._pp).reconcile(*losses, fn = fn, **kwargs)
 
+    def clip_grad_norm_(self, max_norm: float, norm_type: float = 2.0, **kwargs) -> Tensor:
+        return self._pp.clip_grad_norm_(max_norm, norm_type = norm_type, **kwargs)
+
     @property
     def flat_params(self) -> Tensor:
         return self._pp.flat_params
 
     def ema_(self, name: str, value: Tensor, decay: float | Tensor = 0.99, *, members = None) -> Tensor:
         return self._pp.ema_(name, value, decay = decay, members = members)
+
+    def track_(self, name: str, value, *, members = None) -> Tensor:
+        return self._pp.track_(name, value, members = members)
 
     def tracked(self, name: str) -> Tensor | None:
         return self._pp.tracked(name)
@@ -704,7 +742,7 @@ class PopulationOptimizer(Optimizer):
     ) -> Tensor | None:
         if not (self._can_batch and pp.is_population and exists(flat_param)):
             return None
-        if exists(active_indices) or store.items('hp/'):
+        if store.items('hp/'):
             return None
 
         specs = pp._schema.pop_trainable
@@ -713,19 +751,26 @@ class PopulationOptimizer(Optimizer):
         if not exists(grads) and exists(pp._active_grads) and any(s.name not in pp._active_grads for s in specs):
             return None
 
-        analysis = analyze_batched_state(store, specs, allow_hetero = self._can_batch_hetero)
+        analysis = analyze_batched_state(
+            store, specs, allow_hetero = self._can_batch_hetero, active_indices = active_indices,
+        )
         if not exists(analysis):
             return None
 
         mode, is_init = analysis
+        num_active = len(active_indices) if exists(active_indices) else pp.pop_size
+
         if isinstance(grads, Mapping):
-            flat_grad, _ = pack([match_grad(s, grads[s.name], None, pp.pop_size) for s in specs], 'p *')
+            flat_grad, _ = pack([match_grad(s, grads[s.name], active_indices, pp.pop_size) for s in specs], 'p *')
+        elif exists(grads):
+            flat_grad = match_flat_grad(grads, active_indices, pp.pop_size)
         else:
-            flat_grad = grads if exists(grads) else flat_param.grad
+            flat_grad = flat_param.grad[active_indices] if (exists(flat_param.grad) and exists(active_indices)) else flat_param.grad
         if not exists(flat_grad):
             return flat_param
 
-        wp = work_tensor(flat_param, inplace, create_graph)
+        src_param = flat_param[active_indices] if exists(active_indices) else flat_param
+        wp = work_tensor(src_param, inplace, create_graph)
         wg = flat_grad.detach() if inplace else flat_grad
         first = specs[0].name
         state: dict[str, Tensor] = {}
@@ -733,15 +778,21 @@ class PopulationOptimizer(Optimizer):
         if is_init:
             for key in store.slots:
                 buf = store[f'slot/{key}/pop']
-                state[key] = repeat(buf, 'd -> p d', p = pp.pop_size).clone() if buf.ndim == 1 else (buf if inplace else buf.clone())
+                if buf.ndim == 1:
+                    state[key] = repeat(buf, 'd -> p d', p = num_active).clone()
+                elif exists(active_indices):
+                    state[key] = buf[active_indices].clone()
+                else:
+                    state[key] = buf if inplace else buf.clone()
 
             for aux_key in store.aux_keys_for(first):
                 meta = store.aux[aux_key][first]
                 buf = store[f'aux/{aux_key}/{first}']
                 if mode == 'hetero':
-                    state[aux_key] = (buf if meta.shared else rearrange(buf, 'p -> p 1')).to(wp.device).clone()
+                    sel_buf = buf if meta.shared else (buf[active_indices] if exists(active_indices) else buf)
+                    state[aux_key] = (sel_buf if meta.shared else rearrange(sel_buf, 'p -> p 1')).to(wp.device).clone()
                 else:
-                    val = buf if meta.shared else buf[0]
+                    val = buf if meta.shared else buf[active_indices[0] if exists(active_indices) else 0]
                     state[aux_key] = meta.py_type(val.item()) if exists(meta.py_type) else (val.cpu() if meta.cpu_scalar else val).clone()
 
         kwargs = self._filter_kwargs(self._resolve_kwargs(store = store), differentiable = create_graph or mode == 'hetero')
@@ -753,21 +804,22 @@ class PopulationOptimizer(Optimizer):
             val_t = to_state_tensor(val)
             if key in store.slots:
                 slot_key = f'slot/{key}/pop'
-                is_pop = store[slot_key].ndim == 2
-                store.put(slot_key, val_t if is_pop else self._reduce_shared(key, val_t), populated = is_pop, inplace = inplace)
+                cur_slot = store[slot_key]
+                is_pop = cur_slot.ndim == 2
+                out = write_pop_rows_(cur_slot, val_t, active_indices, inplace = inplace) if is_pop else self._reduce_shared(key, val_t)
+                store.put(slot_key, out, populated = is_pop, inplace = inplace)
             elif first in store.aux.get(key, ()):
                 is_shared = store.aux[key][first].shared
                 val_out = rearrange(val_t, 'p 1 -> p') if (not is_shared and val_t.ndim == 2 and val_t.shape[-1] == 1) else val_t
                 for spec in specs:
                     buf_key = f'aux/{key}/{spec.name}'
-                    buf = store[buf_key]
-                    out = val_out.to(buf)
-                    if not is_shared:
-                        out = out.expand_as(buf)
-                    store.put(buf_key, out if inplace else out.clone(), populated = not is_shared, inplace = inplace)
+                    out = write_pop_rows_(store[buf_key], val_out, None if is_shared else active_indices, inplace = inplace)
+                    store.put(buf_key, out, populated = not is_shared, inplace = inplace)
 
-        store.mark_init_(specs)
-        return wp
+        store.mark_init_(specs, active_indices)
+        if inplace and not exists(active_indices):
+            return wp
+        return write_pop_rows_(flat_param.detach() if inplace else flat_param, wp, active_indices, inplace = inplace)
 
     def _commit_group_states_(
         self,

@@ -653,3 +653,148 @@ def test_flat_params_dispatch_sam_es_soup_and_colocated_param_ema():
     soup_out.pow(2).mean().backward()
     assert pop3.population_parameters._pop_param.grad is not None
     assert pop3.population_parameters._pop_param.grad.abs().sum() > 0
+
+
+def test_clip_grad_norm_noop_populated_subset_names_and_shared():
+    torch.manual_seed(24)
+    x = torch.randn(6, 8)
+
+    # 1. Noop parity with torch.nn.utils.clip_grad_norm_ across norm types & names
+    for norm_type in (1.0, 2.0, float('inf')):
+        net_a = TwoBranchNet()
+        net_b = deepcopy(net_a)
+        pop_noop = Population(net_a)
+
+        pop_noop(x).pow(2).sum().backward()
+        net_b(x).pow(2).sum().backward()
+
+        n_pop = pop_noop.clip_grad_norm_(0.25, norm_type = norm_type)
+        n_ref = torch.nn.utils.clip_grad_norm_(net_b.parameters(), 0.25, norm_type = norm_type)
+        assert n_pop.ndim == 0 and torch.allclose(n_pop, n_ref, atol = 1e-6)
+        for pa, pb in zip(net_a.parameters(), net_b.parameters()):
+            assert torch.allclose(pa.grad, pb.grad, atol = 1e-6)
+
+    # 2. Populated per-individual independence (no 1/sqrt(P) shrinkage or cross-member interference)
+    scales = torch.tensor([1e-3, 1.0, 50.0, 0.0])
+    pop = Population(TwoBranchNet, pop_size = 4)
+    refs = [pop[i] for i in range(4)]
+
+    pop.zero_grad()
+    (pop(x).pow(2).mean(dim = (-2, -1)) * scales).sum().backward()
+    for m, s in zip(refs, scales):
+        (m(x).pow(2).mean() * s).backward()
+
+    norms = pop.clip_grad_norm_(0.5)
+    ref_norms = torch.stack([torch.nn.utils.clip_grad_norm_(m.parameters(), 0.5) for m in refs])
+    assert norms.shape == (4,)
+    assert torch.allclose(norms, ref_norms, atol = 1e-5)
+    for i, m in enumerate(refs):
+        for name, p in m.named_parameters():
+            assert torch.allclose(pop.grads_dict[name][i], p.grad, atol = 1e-5)
+
+    # 3. Subset members, single/multi PopulationView, empty mask, and PopulationOptimizer forwarding
+    opt = pop.optimizer(torch.optim.SGD, lr = 1e-2)
+    opt.zero_grad()
+    (pop(x).pow(2).mean(dim = (-2, -1)) * torch.tensor([10., 10., 10., 10.])).sum().backward()
+    g_before = pop.population_parameters._pop_param.grad.clone()
+
+    sub_norms = opt.clip_grad_norm_(0.1, members = [0, 2])
+    assert sub_norms.shape == (2,)
+    assert torch.equal(pop.population_parameters._pop_param.grad[1], g_before[1])
+    assert torch.equal(pop.population_parameters._pop_param.grad[3], g_before[3])
+    assert pop.population_parameters._pop_param.grad[0].norm() <= 0.1 + 1e-5
+    assert pop.population_parameters._pop_param.grad[2].norm() <= 0.1 + 1e-5
+
+    single_norm = pop.view(1).clip_grad_norm_(0.1)
+    assert single_norm.ndim == 0
+    assert pop.population_parameters._pop_param.grad[1].norm() <= 0.1 + 1e-5
+    assert pop.clip_grad_norm_(0.1, members = torch.zeros(4, dtype = torch.bool)).numel() == 0
+
+    # 4. Per-submodule scoping (`names=`) — huge head grad must not crush encoder grad
+    pop.zero_grad()
+    out, hidden = pop(x, return_hidden = True)
+    (hidden.pow(2).mean() + 1000. * out.pow(2).mean()).backward()
+    head_grad_before = pop.grads_dict['head.weight'].clone()
+    enc_norms = pop.clip_grad_norm_(0.2, names = 'encoder')
+    assert enc_norms.shape == (4,)
+    assert torch.equal(pop.grads_dict['head.weight'], head_grad_before)
+    assert pop.grads_dict['encoder.0.weight'].flatten(1).norm(dim = -1).max() <= 0.2 + 1e-5
+
+    # 5. Shared backbone + independent heads + error_if_nonfinite
+    pop_sh = Population(TwoBranchNet, pop_size = 3, shared = ('encoder',))
+    pop_sh.zero_grad()
+    (pop_sh(x).pow(2).mean(dim = (-2, -1)) * torch.tensor([10., 20., 30.])).sum().backward()
+    pop_sh.clip_grad_norm_(0.25)
+    assert pop_sh.population_parameters._pop_param.grad.norm(dim = -1).max() <= 0.25 + 1e-5
+    assert pop_sh.population_parameters._shared_param.grad.norm() <= 0.25 + 1e-5
+
+    pop_sh.population_parameters._pop_param.grad[1, 0] = float('nan')
+    # clipping only member 0 ignores NaN on member 1
+    assert pop_sh.clip_grad_norm_(0.25, members = [0], error_if_nonfinite = True).isfinite().all()
+    with pytest.raises(RuntimeError):
+        pop_sh.clip_grad_norm_(0.25, error_if_nonfinite = True)
+
+    # no-grad safety
+    pop.zero_grad()
+    assert torch.equal(pop.clip_grad_norm_(1.0), torch.zeros(4))
+
+
+def test_track_dtype_agnostic_and_full_lifecycle():
+    torch.manual_seed(25)
+
+    # 1. Noop -> populate carries integer / bool tracked metadata
+    pop = Population(mlp())
+    pop.track_('age', 5)
+    pop.track_('elite', True)
+    assert pop.tracked('age').dtype == torch.int64 and pop.tracked('age').item() == 5
+    assert pop.tracked('elite').dtype == torch.bool and pop.tracked('elite').item() is True
+
+    pop.populate(4, init = 'reinit', keep_first = True)
+    assert pop.tracked('age').tolist() == [5, 0, 0, 0]
+    assert pop.tracked('elite').tolist() == [True, False, False, False]
+
+    # 2. Full pop, subset, PopulationView, and scalar/multi-dim dtypes
+    pop.track_('age', torch.tensor([1, 2, 3, 4]))
+    pop.track_('parents', torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0]]))
+    pop.track_('generation', 7)  # non-populated global scalar
+    assert pop.tracked('generation').ndim == 0 and pop.tracked('generation').item() == 7
+
+    assert pop.view(2).track_('age', 99).item() == 99
+    assert pop.tracked('age').tolist() == [1, 2, 99, 4]
+    pop.view([0, 3]).track_('elite', True)
+    assert pop.tracked('elite').tolist() == [True, False, False, True]
+    pop.track_('age', torch.tensor([10, 20]), members = [1, 3])
+    assert pop.tracked('age').tolist() == [1, 10, 99, 20]
+
+    # 3. Lifecycle lockstep: keep (reorder), delete, append, reset_, replace, slice, clone, state_dict
+    pop.keep([2, 0, 3, 1])
+    assert pop.tracked('age').tolist() == [99, 1, 20, 10]
+    assert pop.tracked('elite').tolist() == [False, True, True, False]
+    assert pop.tracked('parents')[0].tolist() == [2, 3]
+    assert pop.tracked('generation').item() == 7
+
+    pop.reset_(1)
+    assert pop.tracked('age')[1].item() == 0 and pop.tracked('elite')[1].item() is False
+
+    pop.replace(1, 0, reset_opt = False)
+    assert pop.tracked('age')[1].item() == 99 and pop.tracked('parents')[1].tolist() == [2, 3]
+
+    sub = pop[:2]
+    assert sub.tracked('age').tolist() == [99, 99]
+
+    pop.delete(3)
+    assert pop.tracked('age').tolist() == [99, 99, 20]
+    pop.append(0)
+    assert pop.tracked('age').tolist() == [99, 99, 20, 0]
+
+    # state_dict round-trip
+    sd = {k: v.clone() for k, v in pop.state_dict().items()}
+    clone = pop.clone(include_opt = False)
+    clone.track_('age', torch.zeros(4, dtype = torch.long))
+    clone.load_state_dict(sd)
+    assert clone.tracked('age').tolist() == [99, 99, 20, 0]
+
+    # 4. Interop between track_ and ema_ on the same key
+    pop.track_('score', torch.tensor([2., 4., 6., 8.]))
+    pop.ema_('score', torch.tensor([6., 8., 10., 12.]), decay = 0.5)
+    assert torch.allclose(pop.tracked('score'), torch.tensor([4., 6., 8., 10.]))

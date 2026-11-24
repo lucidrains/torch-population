@@ -63,6 +63,36 @@ def pack_param_group(specs: list[TensorSpec], module_params: list[dict[str, Tens
         packed, _ = pack(stacked, 'p *')
     return Parameter(packed, requires_grad = True)
 
+def _clip_grad_tensors_(
+    grads: list[Tensor],
+    max_norm: float,
+    ord_val: float,
+    *,
+    indices: list[int] | None = None,
+    batched: bool = False,
+    error_if_nonfinite: bool = False,
+) -> Tensor:
+    if batched:
+        parts = [
+            torch.linalg.vector_norm((g[indices] if exists(indices) else g).flatten(1), ord = ord_val, dim = -1)
+            for g in grads
+        ]
+    else:
+        parts = [torch.linalg.vector_norm(g.reshape(-1), ord = ord_val) for g in grads]
+
+    total = parts[0] if len(parts) == 1 else torch.linalg.vector_norm(torch.stack(parts, dim = -1), ord = ord_val, dim = -1)
+    if error_if_nonfinite and not torch.isfinite(total).all():
+        raise RuntimeError(f'The total norm of order {ord_val} for gradients is non-finite, so it cannot be clipped.')
+
+    coef = (max_norm / (total + 1e-6)).clamp(max = 1.)
+    for g in grads:
+        scale = coef.reshape(-1, *((1,) * (g.ndim - 1))) if batched else coef
+        if batched and exists(indices):
+            g[indices] = g[indices] * scale
+        else:
+            g.mul_(scale)
+    return total
+
 def copy_tensor_(dst: Tensor, src: Tensor, kind: str, name: str, *, check_shapes: bool = False):
     if check_shapes and src.shape != dst.shape:
         raise ValueError(f'{kind} {name!r} shape mismatch: {tuple(dst.shape)} vs {tuple(src.shape)}')
@@ -804,6 +834,64 @@ class PopulationParameters(Module):
                     dst.copy_(g.detach().to(dst))
         return self
 
+    def _default_device(self) -> torch.device:
+        for t in self._leaf_pair:
+            if exists(t):
+                return t.device
+        for kind in ('parameters', 'buffers'):
+            for _, t in iter_named_unique(self._noop_nets, kind):
+                return t.device
+        return torch.device('cpu')
+
+    @torch.no_grad()
+    def clip_grad_norm_(
+        self,
+        max_norm: float,
+        norm_type: float = 2.0,
+        *,
+        members = None,
+        names = None,
+        error_if_nonfinite: bool = False,
+    ) -> Tensor:
+        max_norm, ord_val = float(max_norm), float(norm_type)
+
+        if not self.is_population:
+            if exists(members) and not self.resolve_members(members):
+                return torch.tensor(0., device = self._default_device())
+            named = self.named_parameters_dict()
+            grads = [
+                named[s.name].grad for s in self._schema.trainable
+                if (not exists(names) or matches_pattern(s.name, names)) and exists(named[s.name].grad)
+            ]
+            if not grads:
+                return torch.tensor(0., device = self._default_device())
+            return _clip_grad_tensors_(grads, max_norm, ord_val, error_if_nonfinite = error_if_nonfinite)
+
+        indices = list(dict.fromkeys(self.resolve_members(members))) if exists(members) else None
+        if exists(indices) and not indices:
+            return torch.empty(0, device = self._default_device())
+        num_active = len(indices) if exists(indices) else self.pop_size
+        scoped = exists(names) or exists(self._active_grads)
+        named_grads = self.named_grads_dict() if scoped else None
+
+        def select_grads(leaf: Tensor | None, specs: list[TensorSpec]) -> list[Tensor]:
+            if not exists(leaf) or not exists(leaf.grad):
+                return []
+            if not scoped:
+                return [leaf.grad]
+            return [g for s in specs if (not exists(names) or matches_pattern(s.name, names)) and exists(g := named_grads.get(s.name))]
+
+        # clip per-member gradients independently; shared gradients clip on their own tensor
+        pop_grads = select_grads(self._pop_leaf, self._schema.pop_trainable)
+        shared_grads = select_grads(self._shared_leaf, self._schema.shared_trainable)
+
+        pop_norm = _clip_grad_tensors_(pop_grads, max_norm, ord_val, indices = indices, batched = True, error_if_nonfinite = error_if_nonfinite) if pop_grads else None
+        shared_norm = _clip_grad_tensors_(shared_grads, max_norm, ord_val, error_if_nonfinite = error_if_nonfinite) if shared_grads else None
+
+        if exists(self._pop_leaf):
+            return default(pop_norm, torch.zeros(num_active, device = self._pop_leaf.device, dtype = self._pop_leaf.dtype))
+        return default(shared_norm, torch.tensor(0., device = self._default_device()))
+
     def zero_grad_(self, members = None, set_to_none: bool = True):
         indices = self.resolve_members(members) if exists(members) else None
         if exists(indices) and not indices:
@@ -946,8 +1034,15 @@ class PopulationParameters(Module):
         return self
 
     @torch.no_grad()
-    def ema_(self, name: str, value: Tensor, decay: float | Tensor = 0.99, *, members = None) -> Tensor:
-        src = value.detach()
+    def _update_track_(
+        self,
+        name: str,
+        value: Tensor | float | bool | Sequence,
+        *,
+        decay: float | Tensor | None = None,
+        members = None,
+    ) -> Tensor:
+        src = value.detach() if is_tensor(value) else torch.as_tensor(value, device = self._default_device())
         key, init_key = f'track/{name}', f'track_init/{name}'
         indices = self.resolve_members(members) if (self.is_population and exists(members)) else None
         if exists(indices) and not indices:
@@ -959,7 +1054,8 @@ class PopulationParameters(Module):
         if not exists(cur):
             if is_pop and exists(indices):
                 has_full = src.ndim >= 1 and src.shape[0] == self.pop_size
-                row_shape = src.shape[1:] if (has_full or (src.ndim >= 1 and src.shape[0] == len(indices))) else src.shape
+                has_sub = not has_full and src.ndim >= 1 and src.shape[0] == len(indices)
+                row_shape = src.shape[1:] if (has_full or has_sub) else src.shape
                 buf = torch.zeros((self.pop_size, *row_shape), device = src.device, dtype = src.dtype)
                 buf[indices] = src[indices] if has_full else src
                 init = torch.zeros(self.pop_size, device = src.device, dtype = torch.bool)
@@ -971,17 +1067,33 @@ class PopulationParameters(Module):
             self.store.set(init_key, init, populated = is_pop)
             return buf
 
-        # sync tracked buffer to incoming tensor's device & float dtype (e.g. after noop net.to())
-        target_dtype = src.dtype if (cur.is_floating_point() and src.is_floating_point()) else cur.dtype
+        if not exists(decay) and not (is_pop and exists(indices)):
+            if cur.shape == src.shape and cur.dtype == src.dtype and cur.device == src.device:
+                cur.copy_(src)
+                self.store[init_key].fill_(True)
+                return cur
+            buf = src.clone()
+            init = torch.ones(self.pop_size if is_pop else (), device = src.device, dtype = torch.bool)
+            self.store.set(key, buf, populated = is_pop)
+            self.store.set(init_key, init, populated = is_pop)
+            return buf
+
+        # sync tracked buffer device (and float dtype on EMA updates, e.g. after noop net.to())
+        target_dtype = src.dtype if (exists(decay) and cur.is_floating_point() and src.is_floating_point()) else cur.dtype
         if cur.device != src.device or cur.dtype != target_dtype:
             cur = self.store.set(key, cur.to(device = src.device, dtype = target_dtype), populated = is_pop)
         init = self.store[init_key]
         if init.device != src.device:
             init = self.store.set(init_key, init.to(device = src.device), populated = is_pop)
 
+        if not exists(decay):
+            cur[indices] = (src[indices] if src.shape == cur.shape else src).to(cur)
+            init[indices] = True
+            return cur
+
         alpha_raw = 1. - decay
         if is_pop and exists(indices):
-            s = (src[indices] if (src.ndim >= 1 and src.shape[0] == self.pop_size) else src).to(cur)
+            s = (src[indices] if src.shape == cur.shape else src).to(cur)
             fresh = ~init[indices]
             updated = cur[indices].lerp(s, lerp_weight(alpha_raw, cur, indices, self.pop_size))
             if fresh.any():
@@ -1003,6 +1115,12 @@ class PopulationParameters(Module):
             else:
                 cur.lerp_(s, lerp_weight(alpha_raw, cur, None, None))
         return cur
+
+    def track_(self, name: str, value: Tensor | float | bool | Sequence, *, members = None) -> Tensor:
+        return self._update_track_(name, value, decay = None, members = members)
+
+    def ema_(self, name: str, value: Tensor | float | Sequence, decay: float | Tensor = 0.99, *, members = None) -> Tensor:
+        return self._update_track_(name, value, decay = decay, members = members)
 
     @torch.no_grad()
     def lerp_(self, other, weight: float | Tensor, *, members = None) -> PopulationParameters:
@@ -1206,18 +1324,23 @@ class PopulationParameters(Module):
             self.store.zero_(prefix, indices = reset_idx, pop_size = self.pop_size)
         return self
 
-    def _extract_source(self, source):
+    def _resolve_single_source(self, source) -> tuple[PopulationParameters, int] | None:
         if is_int_index(source):
-            return self._member_tensors(self._normalize_index(source), clone = True)
+            return self, self._normalize_index(source)
         src_pp = source if isinstance(source, PopulationParameters) else getattr(source, 'population_parameters', None)
         if isinstance(src_pp, PopulationParameters):
             if src_pp.is_population and src_pp.pop_size != 1:
                 raise ValueError(f'cannot extract a single member from population of size {src_pp.pop_size}')
-            return src_pp._member_tensors(0, clone = True)
+            return src_pp, 0
         if hasattr(source, '_pop') and hasattr(source, 'is_single'):
             if not source.is_single:
                 raise ValueError(f'cannot extract a single member from view of size {len(source)}')
-            return source._pop.population_parameters._member_tensors(source._index, clone = True)
+            return source._pop.population_parameters, source._index
+        return None
+
+    def _extract_source(self, source):
+        if exists(resolved := self._resolve_single_source(source)):
+            return resolved[0]._member_tensors(resolved[1], clone = True)
         if isinstance(source, Module):
             return dict(source.named_parameters()), dict(source.named_buffers())
         if isinstance(source, Mapping):
@@ -1237,12 +1360,21 @@ class PopulationParameters(Module):
             self._reset_opts_([idx])
             for prefix in ('track/', 'track_init/'):
                 self.store.zero_(prefix, indices = [idx], pop_size = self.pop_size)
-        elif is_int_index(source):
-            src_idx = self._normalize_index(source)
+            return self
+
+        if exists(resolved := self._resolve_single_source(source)):
+            src_pp, src_idx = resolved
             for prefix in ('track/', 'track_init/'):
-                for k, buf in self.store.items(prefix):
-                    if self.store.is_populated(f'{prefix}{k}', self.pop_size):
-                        buf[idx] = buf[src_idx]
+                for k, dst_buf in self.store.items(prefix):
+                    src_buf = src_pp.store.get(f'{prefix}{k}')
+                    if not exists(src_buf) or not self.store.is_populated(f'{prefix}{k}', self.pop_size):
+                        continue
+                    src_row = src_buf[src_idx] if src_pp.store.is_populated(f'{prefix}{k}', src_pp.pop_size) else src_buf
+                    dst_buf[idx] = src_row.detach().to(dst_buf)
+            src_opts = src_pp._optimizers
+            for name, opt in self._optimizers.items():
+                if name in src_opts:
+                    opt._copy_from_other_opt_([idx], src_opts[name], [src_idx])
         return self
 
     def _finish_resize(self, new_size: int):
