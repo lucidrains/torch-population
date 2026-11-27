@@ -17,6 +17,7 @@ from torch_population.optimizer import PopulationOptimizer
 from torch_population.parameters import PopulationParameters
 from torch_population.store import (
     ParamSlot,
+    check_pop_size,
     clone_template,
     default,
     exists,
@@ -27,10 +28,6 @@ from torch_population.store import (
 )
 
 # helpers
-
-def check_pop_size(pop_size: int):
-    if isinstance(pop_size, bool) or not isinstance(pop_size, int) or pop_size < 1:
-        raise ValueError(f'pop_size must be a positive integer, got {pop_size!r}')
 
 @torch.no_grad()
 def add_param_noise_(module: Module, noise_std: float):
@@ -348,6 +345,9 @@ class Population(Module):
     def set_grads_(self, grads: Tensor | Mapping[str, Tensor | None], *, accumulate: bool = False, names: Iterable[str] | None = None) -> Population:
         self.population_parameters.set_grads_(grads, accumulate = accumulate, names = names)
         return self
+
+    def expand(self, pop_size: int, *, include_opt: bool = True, reset_opt: bool = False) -> PopulationParameters:
+        return self.population_parameters.expand(pop_size, include_opt = include_opt, reset_opt = reset_opt)
 
     def clone(self, *, include_opt: bool = True) -> Population:
         pp = self.population_parameters

@@ -27,6 +27,10 @@ def default(v, d):
 def is_sequence(v) -> bool:
     return isinstance(v, Sequence) and not isinstance(v, (str, bytes))
 
+def check_pop_size(pop_size: int):
+    if isinstance(pop_size, bool) or not isinstance(pop_size, int) or pop_size < 1:
+        raise ValueError(f'pop_size must be a positive integer, got {pop_size!r}')
+
 def is_int_index(k) -> bool:
     if isinstance(k, bool):
         return False

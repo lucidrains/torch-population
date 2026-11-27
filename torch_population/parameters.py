@@ -14,8 +14,10 @@ from torch_population.store import (
     OptStore,
     TensorSpec,
     TensorStore,
+    check_pop_size,
     clone_template,
     default,
+    encode_buffer_key,
     exists,
     init_module,
     is_int_index,
@@ -97,6 +99,27 @@ def copy_tensor_(dst: Tensor, src: Tensor, kind: str, name: str, *, check_shapes
     if check_shapes and src.shape != dst.shape:
         raise ValueError(f'{kind} {name!r} shape mismatch: {tuple(dst.shape)} vs {tuple(src.shape)}')
     dst.copy_(src.detach().to(dst))
+
+def _expand_row(t: Tensor, pop_size: int, has_pop_dim: bool, *, zero: bool = False) -> Tensor:
+    base = t.detach()
+    shape = (pop_size, *base.shape[1:]) if has_pop_dim else (pop_size, *base.shape)
+    if zero:
+        return torch.zeros(shape, device = base.device, dtype = base.dtype)
+    return (base.expand(*shape) if has_pop_dim else base.unsqueeze(0).expand(*shape)).clone()
+
+def _expand_opt_entry(opt_store: OptStore, subkey: str, *, is_pop: bool, reset_opt: bool) -> tuple[bool, bool, bool]:
+    was_pop = is_pop and opt_store.is_populated(subkey, 1)
+    if subkey.startswith('hp/'):
+        return was_pop, False, was_pop
+    if subkey == 'global/_init':
+        return True, reset_opt, True
+    if subkey.startswith('slot/'):
+        _, slot_name, suffix = subkey.split('/', 2)
+        return (suffix == 'pop') and not opt_store.slots[slot_name].shared, reset_opt, was_pop
+    if subkey.startswith('aux/'):
+        _, aux_key, param_name = subkey.split('/', 2)
+        return not opt_store.aux[aux_key][param_name].shared, reset_opt, was_pop
+    return was_pop, reset_opt, was_pop
 
 def lerp_weight(weight: float | Tensor, dst: Tensor, indices: list[int] | None, pop_size: int | None):
     if not is_tensor(weight):
@@ -217,6 +240,7 @@ class PopulationParameters(Module):
         self._set_raw(_noop_net = None, _noop_nets = (), _template = None, _factory = None)
         self._schema = _Schema()
         self._func_leaves: tuple[Tensor | None, Tensor | None] | None = None
+        self._func_params: dict[str, Tensor] | None = None
         if exists(modules):
             self.init_noop(modules, factory = factory)
 
@@ -233,6 +257,7 @@ class PopulationParameters(Module):
         self._set_raw(_noop_net = nets[0] if len(nets) == 1 else None, _noop_nets = nets, _template = None, _factory = factory)
         self._schema = _Schema(nets)
         self._func_leaves = None
+        self._func_params = None
         self._active_grads = None
 
     def init_from_modules(self, modules: list[Module], template: Module, *, shared = (), factory: Callable[[], Module] | None = None):
@@ -247,6 +272,7 @@ class PopulationParameters(Module):
         self._set_raw(_noop_net = None, _noop_nets = (), _template = template, **({'_factory': factory} if exists(factory) else {}))
         self._schema = schema
         self._func_leaves = None
+        self._func_params = None
         self._active_grads = None
 
         self._pop_param = pack_param_group(schema.pop_trainable, module_params, is_shared = False)
@@ -290,6 +316,7 @@ class PopulationParameters(Module):
         pop_size: int | None = None,
         template: Module | None = None,
         functional: bool = False,
+        func_params: dict[str, Tensor] | None = None,
         clone_opts: bool = True,
     ) -> PopulationParameters:
         out = PopulationParameters()
@@ -297,7 +324,10 @@ class PopulationParameters(Module):
         out._set_raw(_noop_net = self._noop_net, _noop_nets = self._noop_nets, _template = default(template, self._template), _factory = self._factory)
         out._schema = self._schema
         out.store = store
-        out._set_leaves(leaves, functional = functional)
+        if exists(func_params):
+            out._func_params = func_params
+        else:
+            out._set_leaves(leaves, functional = functional)
 
         if clone_opts:
             out.opt_stores = {k: v.clone_handle(out) for k, v in self.opt_stores.items()}
@@ -335,25 +365,98 @@ class PopulationParameters(Module):
             clone_opts = clone_opts,
         )
 
+    def _clone_noop(self, *, include_opt: bool, copy_func_params: bool = False) -> PopulationParameters:
+        out = PopulationParameters()
+        out.init_noop(deepcopy(self._noop_nets), factory = self._factory)
+        if copy_func_params and exists(self._func_params):
+            with torch.no_grad():
+                out._copy_member_state_(0, self._func_params, None)
+        out.store = self.store.clone(detach = True, prefixes = self._store_prefixes(include_opt))
+        if include_opt:
+            out.opt_stores = {k: v.clone_handle(out) for k, v in self.opt_stores.items()}
+            out._optimizers = dict(self._optimizers)
+            out._default_opt_name = self._default_opt_name
+        return out
+
     def clone(self, *, include_opt: bool = True) -> PopulationParameters:
-        if not self.is_population:
-            out = PopulationParameters()
-            out.init_noop(deepcopy(self._noop_nets), factory = self._factory)
-            out.store = self.store.clone(detach = True, prefixes = self._store_prefixes(include_opt))
-            if include_opt:
-                out.opt_stores = {k: v.clone_handle(out) for k, v in self.opt_stores.items()}
-                out._optimizers = dict(self._optimizers)
-                out._default_opt_name = self._default_opt_name
-            return out
-        return self.sliced(clone_opts = include_opt, functional = self.is_functional)
+        if self.is_population:
+            return self.sliced(clone_opts = include_opt, functional = self.is_functional)
+        if not self.is_functional:
+            return self._clone_noop(include_opt = include_opt)
+        return self._spawn(
+            self.store.clone(detach = False, prefixes = self._store_prefixes(include_opt)),
+            (None, None),
+            func_params = {k: v.clone() for k, v in self._func_params.items()},
+            clone_opts = include_opt,
+        )
 
     def detach(self, *, include_opt: bool = True) -> PopulationParameters:
-        return self.clone(include_opt = include_opt) if not self.is_population else self.sliced(clone_opts = include_opt)
+        if self.is_population:
+            return self.sliced(clone_opts = include_opt)
+        return self._clone_noop(include_opt = include_opt, copy_func_params = True)
+
+    def expand(self, pop_size: int, *, include_opt: bool = True, reset_opt: bool = False) -> PopulationParameters:
+        check_pop_size(pop_size)
+        if self.is_population and self.pop_size != 1:
+            raise ValueError(f'expand() requires a single-model PopulationParameters (noop or pop_size=1), got pop_size={self.pop_size}')
+        if not exists(self.template):
+            raise ValueError('expand() requires a single-module PopulationParameters')
+
+        if not self.is_population and include_opt:
+            for opt in self._optimizers.values():
+                opt._sync_noop_device()
+
+        if not self.is_population:
+            named_p = self.named_parameters_dict()
+            pop_leaf = self.flat_params.unsqueeze(0).expand(pop_size, -1) if self._schema.trainable else None
+            shared_leaf = None
+        else:
+            pop_leaf = self._pop_leaf.expand(pop_size, -1) if exists(self._pop_leaf) else None
+            shared_leaf = self._shared_leaf
+
+        store = TensorStore()
+        if not self.is_population:
+            for spec in self._schema.specs:
+                if not spec.requires_grad:
+                    store.set(f'frozen/{spec.name}', _expand_row(named_p[spec.name], pop_size, False), populated = True)
+            sd_keys = set(self._noop_net.state_dict()) if exists(self._noop_net) else set()
+            for name, buf in self.named_buffers_dict().items():
+                store.set(f'buffer/{name}', _expand_row(buf, pop_size, False), populated = True, persistent = name in sd_keys, append_repeat = True)
+        else:
+            for prefix in ('frozen/', 'buffer/'):
+                for key, tensor in self.store.items(prefix):
+                    full_key = f'{prefix}{key}'
+                    is_pop = self.store.is_populated(full_key, 1)
+                    val = _expand_row(tensor, pop_size, True) if is_pop else tensor.detach().clone()
+                    store.set(
+                        full_key, val,
+                        populated = is_pop,
+                        persistent = encode_buffer_key(full_key) not in self.store._non_persistent_buffers_set,
+                        append_repeat = full_key in self.store._repeat_on_append,
+                    )
+
+        if include_opt:
+            for opt_store in self.opt_stores.values():
+                for subkey, tensor in opt_store.items():
+                    full_key = opt_store._prefix + subkey
+                    should_pop, should_zero, has_dim = _expand_opt_entry(opt_store, subkey, is_pop = self.is_population, reset_opt = reset_opt)
+                    val = _expand_row(tensor, pop_size, has_dim, zero = should_zero) if should_pop else (torch.zeros_like(tensor) if should_zero else tensor.detach().clone())
+                    store.set(full_key, val, populated = should_pop, append_repeat = full_key in self.store._repeat_on_append)
+
+        return self._spawn(
+            store, (pop_leaf, shared_leaf),
+            pop_size = pop_size,
+            template = self.template,
+            functional = True,
+            clone_opts = include_opt,
+        )
 
     def _apply(self, fn, recurse = True):
         res = super()._apply(fn, recurse = recurse)
         if exists(self._func_leaves):
             self._func_leaves = tuple(fn(t) if exists(t) else None for t in self._func_leaves)
+        if exists(self._func_params):
+            self._func_params = {k: fn(v) for k, v in self._func_params.items()}
         return res
 
     def _load_from_state_dict(self, *args, **kwargs):
@@ -369,7 +472,7 @@ class PopulationParameters(Module):
 
     @property
     def is_functional(self) -> bool:
-        return exists(self._func_leaves)
+        return exists(self._func_leaves) or exists(self._func_params)
 
     @property
     def template(self) -> Module:
@@ -527,6 +630,8 @@ class PopulationParameters(Module):
 
     def named_parameters_dict(self, *, track_grads: bool = False) -> dict[str, Tensor]:
         if not self.is_population:
+            if exists(self._func_params):
+                return dict(self._func_params)
             return dict(iter_named_unique(self._noop_nets, 'parameters'))
 
         schema = self._schema
@@ -1418,7 +1523,7 @@ class PopulationParameters(Module):
 
     def extra_repr(self) -> str:
         num_params = sum(s.numel for s in self._schema.trainable)
-        if not self.is_population:
-            return f'noop, num_params={num_params}'
         mode = 'functional' if self.is_functional else 'backed'
+        if not self.is_population:
+            return f'noop, num_params={num_params}' + (f', mode={mode}' if self.is_functional else '')
         return f'pop_size={self.pop_size}, num_params={num_params}, mode={mode}'

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 from einops import pack, rearrange, repeat
 from torch import Tensor, is_tensor
+from torch.autograd import grad as torch_grad
 from torch.nn import Module
 from torch.optim import Optimizer
 from torch.overrides import TorchFunctionMode
@@ -118,6 +119,32 @@ def filter_optimizer_kwargs(kwargs: dict, accepted: set[str] | None, *, differen
 
 def work_tensor(t: Tensor, inplace: bool, create_graph: bool) -> Tensor:
     return t.detach() if inplace else (t.clone() if create_graph else t.detach().clone())
+
+def _clip_functional_grad(grad: Tensor, max_norm: float, *, batched: bool) -> Tensor:
+    dim = -1 if batched else None
+    norm = grad.square().sum(dim = dim, keepdim = batched).clamp(min = 1e-12).sqrt()
+    return grad * (max_norm / (norm + 1e-6)).clamp(max = 1.)
+
+def _scale_named_(grads: dict[str, Tensor], names: list[str], max_norm: float, *, batched: bool):
+    if not names:
+        return
+    sq_sum = sum(grads[n].flatten(1).square().sum(dim = -1) if batched else grads[n].square().sum() for n in names)
+    scale = (max_norm / (sq_sum.clamp(min = 1e-12).sqrt() + 1e-6)).clamp(max = 1.)
+    for n in names:
+        g = grads[n]
+        grads[n] = g * (scale.reshape(-1, *((1,) * (g.ndim - 1))) if batched else scale)
+
+def _clip_named_grads(named_grads: Mapping[str, Tensor | None], specs: list[TensorSpec], max_norm: float, *, is_pop: bool) -> dict[str, Tensor]:
+    out = {k: v for k, v in named_grads.items() if exists(v)}
+    if not is_pop:
+        _scale_named_(out, [s.name for s in specs if s.name in out], max_norm, batched = False)
+        return out
+    for is_shared in (False, True):
+        active = [s for s in specs if s.shared == is_shared and s.name in out]
+        if active:
+            batched = not is_shared and out[active[0].name].ndim > len(active[0].shape)
+            _scale_named_(out, [s.name for s in active], max_norm, batched = batched)
+    return out
 
 def write_pop_rows_(dst: Tensor, val: Tensor, indices: list[int] | None, *, inplace: bool) -> Tensor:
     val = val.to(dst)
@@ -289,14 +316,15 @@ def analyze_batched_state(
     all_aux_uniform = True
     for aux_key in aux_keys:
         meta = store.aux[aux_key][first]
+        is_pop_aux = store._pp.is_population and not meta.shared
         ref = store[f'aux/{aux_key}/{first}']
-        if ref.ndim != (0 if meta.shared else 1):
+        if ref.ndim != (1 if is_pop_aux else 0):
             return None
-        sel = (lambda t: t[active_indices]) if (exists(active_indices) and not meta.shared) else (lambda t: t)
+        sel = (lambda t: t[active_indices]) if (exists(active_indices) and is_pop_aux) else (lambda t: t)
         ref_sel = sel(ref)
         if any((t := store[f'aux/{aux_key}/{name}']).shape != ref.shape or not (sel(t) == ref_sel).all() for name in rest):
             return None
-        if not meta.shared and not (ref_sel == ref_sel[0]).all():
+        if is_pop_aux and not (ref_sel == ref_sel[0]).all():
             all_aux_uniform = False
 
     if row_init.all() and all_aux_uniform:
@@ -740,9 +768,7 @@ class PopulationOptimizer(Optimizer):
         active_indices: list[int] | None = None,
         create_graph: bool = False,
     ) -> Tensor | None:
-        if not (self._can_batch and pp.is_population and exists(flat_param)):
-            return None
-        if store.items('hp/'):
+        if not (self._can_batch and exists(flat_param)) or store.items('hp/'):
             return None
 
         specs = pp._schema.pop_trainable
@@ -752,7 +778,7 @@ class PopulationOptimizer(Optimizer):
             return None
 
         analysis = analyze_batched_state(
-            store, specs, allow_hetero = self._can_batch_hetero, active_indices = active_indices,
+            store, specs, allow_hetero = self._can_batch_hetero and pp.is_population, active_indices = active_indices,
         )
         if not exists(analysis):
             return None
@@ -761,9 +787,9 @@ class PopulationOptimizer(Optimizer):
         num_active = len(active_indices) if exists(active_indices) else pp.pop_size
 
         if isinstance(grads, Mapping):
-            flat_grad, _ = pack([match_grad(s, grads[s.name], active_indices, pp.pop_size) for s in specs], 'p *')
+            flat_grad, _ = pack([match_grad(s, grads[s.name], active_indices, pp.pop_size) for s in specs], 'p *' if pp.is_population else '*')
         elif exists(grads):
-            flat_grad = match_flat_grad(grads, active_indices, pp.pop_size)
+            flat_grad = match_flat_grad(grads, active_indices, pp.pop_size) if pp.is_population else grads
         else:
             flat_grad = flat_param.grad[active_indices] if (exists(flat_param.grad) and exists(active_indices)) else flat_param.grad
         if not exists(flat_grad):
@@ -778,7 +804,7 @@ class PopulationOptimizer(Optimizer):
         if is_init:
             for key in store.slots:
                 buf = store[f'slot/{key}/pop']
-                if buf.ndim == 1:
+                if pp.is_population and buf.ndim == 1:
                     state[key] = repeat(buf, 'd -> p d', p = num_active).clone()
                 elif exists(active_indices):
                     state[key] = buf[active_indices].clone()
@@ -792,7 +818,7 @@ class PopulationOptimizer(Optimizer):
                     sel_buf = buf if meta.shared else (buf[active_indices] if exists(active_indices) else buf)
                     state[aux_key] = (sel_buf if meta.shared else rearrange(sel_buf, 'p -> p 1')).to(wp.device).clone()
                 else:
-                    val = buf if meta.shared else buf[active_indices[0] if exists(active_indices) else 0]
+                    val = buf if (not pp.is_population or meta.shared) else buf[active_indices[0] if exists(active_indices) else 0]
                     state[aux_key] = meta.py_type(val.item()) if exists(meta.py_type) else (val.cpu() if meta.cpu_scalar else val).clone()
 
         kwargs = self._filter_kwargs(self._resolve_kwargs(store = store), differentiable = create_graph or mode == 'hetero')
@@ -806,15 +832,17 @@ class PopulationOptimizer(Optimizer):
                 slot_key = f'slot/{key}/pop'
                 cur_slot = store[slot_key]
                 is_pop = cur_slot.ndim == 2
-                out = write_pop_rows_(cur_slot, val_t, active_indices, inplace = inplace) if is_pop else self._reduce_shared(key, val_t)
+                out = write_pop_rows_(cur_slot, val_t, active_indices, inplace = inplace) if is_pop else (
+                    self._reduce_shared(key, val_t) if pp.is_population else val_t.to(cur_slot)
+                )
                 store.put(slot_key, out, populated = is_pop, inplace = inplace)
             elif first in store.aux.get(key, ()):
-                is_shared = store.aux[key][first].shared
-                val_out = rearrange(val_t, 'p 1 -> p') if (not is_shared and val_t.ndim == 2 and val_t.shape[-1] == 1) else val_t
+                is_pop_aux = pp.is_population and not store.aux[key][first].shared
+                val_out = rearrange(val_t, 'p 1 -> p') if (is_pop_aux and val_t.ndim == 2 and val_t.shape[-1] == 1) else val_t
                 for spec in specs:
                     buf_key = f'aux/{key}/{spec.name}'
-                    out = write_pop_rows_(store[buf_key], val_out, None if is_shared else active_indices, inplace = inplace)
-                    store.put(buf_key, out, populated = not is_shared, inplace = inplace)
+                    out = write_pop_rows_(store[buf_key], val_out, active_indices if is_pop_aux else None, inplace = inplace)
+                    store.put(buf_key, out, populated = is_pop_aux, inplace = inplace)
 
         store.mark_init_(specs, active_indices)
         if inplace and not exists(active_indices):
@@ -863,7 +891,7 @@ class PopulationOptimizer(Optimizer):
                     store.set(buf_key, val.to(store[buf_key].device), populated = exists(indices) and not spec.shared and not is_shared_key)
 
         if not inplace:
-            store.pack_slots_(next_views, is_pop_group = exists(indices))
+            store.pack_slots_(next_views, is_pop_group = (not store._pp.is_population) or exists(indices))
 
     def _step_group(
         self,
@@ -916,7 +944,7 @@ class PopulationOptimizer(Optimizer):
         if not specs or (pp.is_population and not exists(leaf)):
             return leaf
 
-        if is_pop:
+        if is_pop or not pp.is_population:
             batched = self._try_batched_step(
                 pp, store, leaf, flat_grad if exists(flat_grad) else named_grads,
                 inplace = inplace, active_indices = active_indices, create_graph = create_graph,
@@ -927,7 +955,7 @@ class PopulationOptimizer(Optimizer):
         if inplace and not exists(flat_grad) and not exists(named_grads):
             named_grads = pp.named_grads_dict()
 
-        if exists(flat_grad) and pp.is_population:
+        if exists(flat_grad) and exists(leaf):
             items = [
                 (s, slice_spec(s, leaf), match_grad(s, slice_spec(s, flat_grad), active_indices, pp.pop_size))
                 for s in specs
@@ -1131,16 +1159,21 @@ class PopulationOptimizer(Optimizer):
         create_graph: bool = True,
         retain_graph: bool | None = None,
         detach_preconditioner: bool = True,
+        max_grad_norm: float | None = None,
     ) -> PopulationParameters:
         if exists(loss) == exists(grads):
             raise ValueError('pass exactly one of loss or grads to functional_step')
 
         pp = default(params, self._pp)
-        pp._require_pop('functional_step')
         if self.name not in pp.opt_stores:
             raise ValueError(f'params has no optimizer state for {self.name!r} (was it cloned with include_opt=False?)')
 
+        if not pp.is_population and pp is self._pp:
+            self._sync_noop_device()
+
         active_indices = self._member_indices(members, pp = pp)
+        named_p = None if pp.is_population else pp.named_parameters_dict()
+        specs = pp._schema.trainable
         leaf_grads: tuple[Tensor | None, Tensor | None] = (None, None)
         named_grads = None
 
@@ -1151,33 +1184,73 @@ class PopulationOptimizer(Optimizer):
                 named_grads = grads
             else:
                 raise TypeError(f'grads must be Tensor or Mapping, got {type(grads).__name__}')
-        else:
+        elif pp.is_population:
+            if loss.ndim == 1 and loss.shape[0] == (len(active_indices) if exists(active_indices) else pp.pop_size):
+                loss = loss.sum()
             leaf_grads = pp._leaf_grads(loss, create_graph = create_graph, retain_graph = retain_graph)
+        else:
+            raw = torch_grad(
+                loss, [named_p[s.name] for s in specs],
+                only_inputs = True,
+                create_graph = create_graph,
+                retain_graph = default(retain_graph, create_graph),
+                allow_unused = True,
+            )
+            named_grads = {s.name: g for s, g in zip(specs, raw) if exists(g)}
 
         if not create_graph:
             leaf_grads = tuple(g.detach() if exists(g) else None for g in leaf_grads)
             if exists(named_grads):
                 named_grads = {k: v.detach() for k, v in named_grads.items() if exists(v)}
 
+        if exists(max_grad_norm):
+            max_norm = float(max_grad_norm)
+            leaf_grads = (
+                _clip_functional_grad(leaf_grads[0], max_norm, batched = leaf_grads[0].ndim > 1) if exists(leaf_grads[0]) else None,
+                _clip_functional_grad(leaf_grads[1], max_norm, batched = False) if exists(leaf_grads[1]) else None,
+            )
+            if exists(named_grads):
+                named_grads = _clip_named_grads(named_grads, specs, max_norm, is_pop = pp.is_population)
+
         next_store_bank = pp.store.clone(
             detach = True,
             prefixes = ('frozen/', 'buffer/', 'opt/'),
             shallow_prefixes = ('opt/',) if create_graph else (),
         )
-        next_pp = pp._spawn(next_store_bank, (None, None), functional = create_graph)
+        out_params = None if pp.is_population else dict(named_p)
+        next_pp = pp._spawn(next_store_bank, (None, None), functional = create_graph, func_params = out_params)
         next_store = next_pp.opt_stores[self.name]
-        next_store.set('global/_init', next_store['global/_init'].clone(), populated = True)
+        next_store.set('global/_init', next_store['global/_init'].clone(), populated = pp.is_population)
 
         grad_ctx = torch.enable_grad() if create_graph else torch.no_grad()
         mode_ctx = _DifferentiableStepMode(detach_preconditioner) if create_graph else nullcontext()
 
         with grad_ctx, mode_ctx:
-            next_leaves = self._step_leaves(
-                next_pp, next_store, pp._leaf_pair, leaf_grads, named_grads,
-                inplace = False, active_indices = active_indices, create_graph = create_graph,
-            )
+            if pp.is_population:
+                next_leaves = self._step_leaves(
+                    next_pp, next_store, pp._leaf_pair, leaf_grads, named_grads,
+                    inplace = False, active_indices = active_indices, create_graph = create_graph,
+                )
+            elif len({named_p[s.name].dtype for s in specs}) <= 1:
+                flat_leaf = pp.flat_params if specs else None
+                next_flat = self._step_leaf(
+                    next_pp, next_store, specs, flat_leaf, leaf_grads[0], named_grads,
+                    is_pop = False, inplace = False, create_graph = create_graph,
+                )
+                out_params.update(pp.unpack_flat(next_flat) if exists(next_flat) else {})
+            else:
+                grad_map = pp.unpack_flat(leaf_grads[0]) if exists(leaf_grads[0]) else (named_grads or {})
+                items = [(s, named_p[s.name], grad_map[s.name]) for s in specs if exists(grad_map.get(s.name))]
+                if items:
+                    fixed_kwargs = self._filter_kwargs(self._resolve_kwargs(store = next_store), differentiable = create_graph)
+                    stepped = self._step_group(next_store, items, None, inplace = False, create_graph = create_graph, fixed_kwargs = fixed_kwargs)
+                    out_params.update({s.name: t for (s, _, _), t in zip(items, stepped[0])})
 
-        next_pp._set_leaves(next_leaves, functional = create_graph, orig = pp._leaf_pair)
+        if pp.is_population:
+            next_pp._set_leaves(next_leaves, functional = create_graph, orig = pp._leaf_pair)
+        elif not create_graph:
+            trainable_names = {s.name for s in specs}
+            next_pp._func_params = {k: v.detach().clone().requires_grad_(k in trainable_names) for k, v in out_params.items()}
         return next_pp
 
     # lifecycle hooks
